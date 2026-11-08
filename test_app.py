@@ -316,6 +316,14 @@ class MediaTests(unittest.TestCase):
             self.assertEqual(send.call_args.args[2],{})
 
 
+    def test_twitter_sizes_follow_selected_variants_without_extra_requests(self):
+        tweet={'id_str':'123','text':'Video','mediaDetails':[{'type':'video','video_info':{'duration_millis':10000,'variants':[{'content_type':'video/mp4','url':'https://video.twimg.com/360x640/a.mp4','bitrate':800000,'filesize':1000000},{'content_type':'video/mp4','url':'https://video.twimg.com/720x1280/b.mp4','bitrate':1600000}]}}]}
+        response=httpx.Response(200,json=tweet,request=httpx.Request('GET','https://cdn.syndication.twimg.com/'))
+        with patch.object(app.source_http,'get',return_value=response) as get,patch.object(app,'public_url',side_effect=lambda u:u):
+            post=app.twitter_public_post('https://x.com/user/status/123')
+            self.assertEqual(app.metadata(post)['video_sizes'],{360:{'bytes':1000000,'estimated':False},720:{'bytes':2000000,'estimated':True}})
+            self.assertEqual(get.call_count,1)
+
     def test_twitter_text_only_and_photo_syndication(self):
         tweet={'id_str':'123','text':'A text-only tweet'}
         def response():return httpx.Response(200,json=tweet,request=httpx.Request('GET','https://cdn.syndication.twimg.com/'))

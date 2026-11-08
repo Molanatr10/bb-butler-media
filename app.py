@@ -297,15 +297,29 @@ def twitter_public_post(url):
                 if v.get('content_type')!='video/mp4':continue
                 address=public_url(v.get('url'));dimensions=re.search(r'/(\d+)x(\d+)/',address)
                 h=min(map(int,dimensions.groups())) if dimensions else min((media.get('original_info') or {}).get('width',1080),(media.get('original_info') or {}).get('height',1080))
-                variants.append({'url':address,'height':h,'bitrate':int(v.get('bitrate') or 0)})
+                variants.append({'url':address,'height':h,'bitrate':int(v.get('bitrate') or 0),'filesize':v.get('filesize')})
                 if 144<=h<=1080:heights.add(h)
             if variants:
                 best=max(variants,key=lambda v:(v['height'],v['bitrate']))
-                files.append((best['url'],{'extension':'mp4','variants':variants}))
+                files.append((best['url'],{'extension':'mp4','variants':variants,'duration':float(info.get('duration_millis') or 0)/1000}))
     if len(files)>20:raise MediaError('Use a post with 20 or fewer media items.')
     if not files and not caption:raise MediaError('This tweet has no public text or media.')
     author=data.get('user') or {};name=str(author.get('name') or author.get('screen_name') or 'Twitter author')[:128]
-    return {'engine':'direct' if files else 'text','files':files,'heights':sorted(heights),'info':{'title':caption[:180] or 'Twitter post','description':caption},'source_author':{'name':name,'username':str(author.get('screen_name') or ''),'url':'https://x.com/i/status/'+identifier+'?mx=2'},'original_only':not heights}
+    sizes={}
+    for height in heights:
+        total=0;estimated=False
+        for _,meta in files:
+            if not meta.get('variants'):continue
+            choices=[v for v in meta['variants'] if v['height']<=height] or meta['variants']
+            selected=max(choices,key=lambda v:(v['height'],v['bitrate']))
+            exact=selected.get('filesize')
+            if isinstance(exact,(int,float)) and math.isfinite(exact) and exact>0:total+=exact
+            elif selected['bitrate']>0 and meta['duration']>0:
+                total+=selected['bitrate']*meta['duration']/8;estimated=True
+            else:break
+        else:
+            if total>0:sizes[height]={'bytes':round(total),'estimated':estimated}
+    return {'engine':'direct' if files else 'text','files':files,'heights':sorted(heights),'video_sizes':sizes,'info':{'title':caption[:180] or 'Twitter post','description':caption},'source_author':{'name':name,'username':str(author.get('screen_name') or ''),'url':'https://x.com/i/status/'+identifier+'?mx=2'},'original_only':not heights}
 
 
 class InstagramSimplePhoto(HTMLParser):
@@ -459,7 +473,7 @@ def metadata(post):
         has_video = any(str(meta.get('extension') or '').lower() in ('mp4', 'webm', 'mov') for _, meta in post['files'])
         heights = post.get('heights',[] if post.get('original_only') else [360,480,720,1080] if has_video else [])
         has_audio=has_video
-    return {'caption': caption, 'title': title, 'language': language, 'has_video': has_video,'has_audio':has_audio,'media_type':'video' if has_video else 'audio' if has_audio else 'images', 'heights': heights,'original_only':bool(post.get('original_only')),'source_author':post.get('source_author'),'audio_modes':['audio','mp3'] if has_audio else []}
+    return {'caption': caption, 'title': title, 'language': language, 'has_video': has_video,'has_audio':has_audio,'media_type':'video' if has_video else 'audio' if has_audio else 'images', 'heights': heights,'video_sizes':post.get('video_sizes',{}),'original_only':bool(post.get('original_only')),'source_author':post.get('source_author'),'audio_modes':['audio','mp3'] if has_audio else []}
 
 
 def convert_sticker(source, output):
