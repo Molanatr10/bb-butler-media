@@ -111,23 +111,24 @@ def public_url(url):
 
 
 def fetch_file(url, target, limit, headers=None):
-    with httpx.Client(timeout=30, follow_redirects=False) as client:
-        for _ in range(5):
-            public_url(url)
-            with client.stream('GET', url, headers=headers or {}) as r:
-                if r.is_redirect:
-                    from urllib.parse import urljoin
-                    url = urljoin(url, r.headers.get('location', ''))
-                    continue
-                r.raise_for_status()
-                size = 0
-                with open(target, 'wb') as f:
-                    for chunk in r.iter_bytes(65536):
-                        size += len(chunk)
-                        if size > limit:
-                            raise MediaError('This media is too large. Choose a lower resolution or a shorter clip.')
-                        f.write(chunk)
-                return
+    for _ in range(5):
+        public_url(url)
+        with source_http.stream('GET', url, headers=headers or {},timeout=30) as r:
+            if r.is_redirect:
+                from urllib.parse import urljoin
+                url = urljoin(url, r.headers.get('location', ''))
+                continue
+            r.raise_for_status()
+            declared=r.headers.get('content-length')
+            if declared and declared.isdigit() and int(declared)>limit:raise MediaError('This media is too large. Choose a lower resolution or a shorter clip.')
+            size = 0
+            with open(target, 'wb') as f:
+                for chunk in r.iter_bytes(65536):
+                    size += len(chunk)
+                    if size > limit:
+                        raise MediaError('This media is too large. Choose a lower resolution or a shorter clip.')
+                    f.write(chunk)
+            return
     raise MediaError('The media address redirected too many times.')
 
 
@@ -452,6 +453,51 @@ def _extract_post_info(url,directory):
     return {'engine': 'gallery-dl', 'files': files, 'info': files[0][1]}
 
 
+def format_bytes(format,duration):
+    for field,estimated in [('filesize',False),('contentLength',False),('filesize_approx',True)]:
+        try:
+            size=float(format.get(field) or 0)
+            if math.isfinite(size) and size>0:return size,estimated
+        except (TypeError,ValueError):pass
+    try:
+        bitrate=float(format.get('tbr') or 0)*1000 or float(format.get('bitrate') or 0)
+        duration=float(duration or 0)
+        if math.isfinite(bitrate) and math.isfinite(duration) and bitrate>0 and duration>0:return bitrate*duration/8,True
+    except (TypeError,ValueError):pass
+    return None
+
+
+def video_format_sizes(post,heights):
+    if post.get('video_sizes'):return post['video_sizes']
+    sizes={}
+    if post['engine'] not in ('yt-dlp','invidious'):return sizes
+    entries=post['entries'] if post['engine']=='yt-dlp' else [post]
+    for height in heights:
+        total=0;estimated=False
+        for entry in entries:
+            formats=entry.get('formats',[]);duration=entry.get('duration') or post['info'].get('duration')
+            if post['engine']=='yt-dlp':
+                video=[f for f in formats if f.get('vcodec') not in ('none',None) and 0<float(f.get('height') or 0)<=height]
+                audio=[f for f in formats if f.get('vcodec')=='none' and f.get('acodec') not in ('none',None)]
+                mp4=[f for f in video if f.get('ext')=='mp4'];video=mp4 or video
+                if not video:break
+                selected=max(video,key=lambda f:(float(f.get('height') or 0),float(f.get('tbr') or 0)))
+                audio=audio if selected.get('acodec') in ('none',None) else []
+            else:
+                video=[f for f in formats if str(f.get('type','')).startswith('video/') and 0<format_height(f)<=height]
+                audio=[f for f in formats if str(f.get('type','')).startswith('audio/')]
+                if not video:break
+                selected=max(video,key=lambda f:(format_height(f),'mp4' in f.get('type',''),int(f.get('bitrate') or 0)))
+            parts=[selected]
+            if audio:parts.append(max(audio,key=lambda f:(f.get('ext')=='m4a' or 'mp4' in f.get('type',''),float(f.get('abr') or f.get('bitrate') or 0))))
+            values=[format_bytes(f,duration) for f in parts]
+            if any(v is None for v in values):break
+            total+=sum(v[0] for v in values);estimated=estimated or len(parts)>1 or any(v[1] for v in values)
+        else:
+            if total>0:sizes[height]={'bytes':round(total),'estimated':estimated}
+    return sizes
+
+
 def metadata(post):
     info = post['info']
     caption = str(info.get('description') or info.get('content') or info.get('caption') or info.get('title') or '')[:6000]
@@ -482,7 +528,7 @@ def metadata(post):
         has_video = any(str(meta.get('extension') or '').lower() in ('mp4', 'webm', 'mov') for _, meta in post['files'])
         heights = post.get('heights',[] if post.get('original_only') else [360,480,720,1080] if has_video else [])
         has_audio=has_video
-    return {'caption': caption, 'title': title, 'language': language, 'has_video': has_video,'has_audio':has_audio,'media_type':'video' if has_video else 'audio' if has_audio else 'images', 'heights': heights,'video_sizes':post.get('video_sizes',{}),'original_only':bool(post.get('original_only')),'source_author':post.get('source_author'),'audio_modes':['audio','mp3'] if has_audio else []}
+    return {'caption': caption, 'title': title, 'language': language, 'has_video': has_video,'has_audio':has_audio,'media_type':'video' if has_video else 'audio' if has_audio else 'images', 'heights': heights,'video_sizes':video_format_sizes(post,heights),'original_only':bool(post.get('original_only')),'source_author':post.get('source_author'),'audio_modes':['audio','mp3'] if has_audio else []}
 
 
 def convert_sticker(source, output):
@@ -905,7 +951,7 @@ def execute(job):
 
 @app.get('/health')
 def health():
-    return {'ok': True, 'release': '2026-11-08-youtube-cache'}
+    return {'ok': True, 'release': '2026-11-08-media-latency'}
 
 
 @app.post('/jobs')
@@ -932,7 +978,11 @@ def submit(job: Request, authorization: str = Header(default='')):
             raise HTTPException(429, 'Queue full')
         ready=threading.Event()
         jobs[job.id] = {'status': 'running', 'created': time.time(), 'fingerprint': fingerprint, 'ready':ready}
-        with cache_lock:cached=file_cache.get(media_key(job)) if job.kind=='download' else None
+        with cache_lock:
+            cached=file_cache.get(media_key(job)) if job.kind=='download' else None
+            post_key='https://www.youtube.com/watch?v='+youtube_id(job.url) if youtube_id(job.url or '') else job.url
+            inspected=post_cache.get(post_key) if job.kind=='inspect' else None
+            inspected=bool(inspected and inspected[0]>time.time())
         host=(urlparse(job.url or '').hostname or '').removeprefix('www.')
         direct_source=host in ('x.com','twitter.com','mobile.twitter.com','instagram.com','tiktok.com','m.tiktok.com','vm.tiktok.com','vt.tiktok.com')
         executor=(youtube_pool if youtube_id(job.url or '') else inspect_pool) if job.kind=='inspect' else delivery_pool if cached and cached[0]>time.time() or job.kind=='download' and direct_source and job.mode in ('video','images') else pool
@@ -940,7 +990,7 @@ def submit(job: Request, authorization: str = Header(default='')):
     # Fast inspections and Telegram sends can finish during the request. Return
     # their receipt immediately instead of forcing a callback/poll round trip.
     # Never hold the jobs lock while waiting for the executor to finish.
-    if (job.kind=='inspect' and not youtube_id(job.url or '')) or job.kind=='download' and (cached and cached[0]>time.time() or direct_source and job.mode in ('video','images')):
+    if (job.kind=='inspect' and (inspected or not youtube_id(job.url or ''))) or job.kind=='download' and (cached and cached[0]>time.time() or direct_source and job.mode in ('video','images')):
         if ready.wait(.8):
             with lock:
                 current=jobs.get(job.id,{})

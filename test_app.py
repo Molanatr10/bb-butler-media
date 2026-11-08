@@ -16,6 +16,43 @@ from PIL import Image
 
 
 class MediaTests(unittest.TestCase):
+    def test_cached_youtube_inspection_returns_receipt_in_the_initial_request(self):
+        import threading,time
+        release=threading.Event();started=threading.Event();finished=threading.Event()
+        def callback(job):started.set();release.wait(2);finished.set()
+        app.post_cache['https://www.youtube.com/watch?v=abcdefghijk']=(time.time()+60,{})
+        try:
+            with patch.object(app,'metadata',return_value={'media_type':'video','heights':[360]}),patch.object(app,'notify_completion',side_effect=callback):
+                r=self.client.post('/jobs',headers=self.headers,json={**self.job,'url':'https://youtu.be/abcdefghijk'})
+                self.assertEqual(r.json()['status'],'done')
+                self.assertTrue(started.wait(1));self.assertFalse(finished.is_set())
+        finally:release.set();self.assertTrue(finished.wait(2))
+
+    def test_shared_download_client_preserves_redirect_and_size_guards(self):
+        urls=[]
+        def serve(request):
+            urls.append(str(request.url))
+            if request.url.path=='/start':return httpx.Response(302,headers={'location':'/file'})
+            return httpx.Response(200,content=b'actual bytes')
+        with httpx.Client(transport=httpx.MockTransport(serve),follow_redirects=False) as client,tempfile.TemporaryDirectory() as d,patch.object(app,'source_http',client),patch.object(app,'public_url',side_effect=lambda u:u) as validate:
+            target=Path(d)/'out';app.fetch_file('https://cdn.example.org/start',target,50)
+            self.assertEqual(target.read_bytes(),b'actual bytes');self.assertEqual(validate.call_count,2)
+            app.fetch_file('https://cdn.example.org/file',target,50)
+            self.assertFalse(client.is_closed)
+            with self.assertRaises(app.MediaError):app.fetch_file('https://cdn.example.org/file',target,4)
+        self.assertEqual(urls[0:2],['https://cdn.example.org/start','https://cdn.example.org/file'])
+
+    def test_youtube_format_sizes_include_separate_audio_and_mark_estimates(self):
+        post={'engine':'yt-dlp','info':{'duration':10},'entries':[{'duration':10,'formats':[
+            {'height':360,'ext':'mp4','vcodec':'h264','acodec':'aac','filesize':2000000},
+            {'height':720,'ext':'mp4','vcodec':'h264','acodec':'none','filesize':4000000},
+            {'ext':'m4a','vcodec':'none','acodec':'aac','filesize':200000}]}]}
+        sizes=app.video_format_sizes(post,[360,720])
+        self.assertEqual(sizes[360],{'bytes':2000000,'estimated':False})
+        self.assertEqual(sizes[720],{'bytes':4200000,'estimated':True})
+        self.assertEqual(app.format_bytes({'tbr':800},10),(1000000,True))
+        self.assertIsNone(app.format_bytes({},10))
+
     def test_fast_inspection_returns_receipt_without_waiting_for_callback(self):
         import threading
         release=threading.Event();started=threading.Event();finished=threading.Event()

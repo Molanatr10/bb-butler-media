@@ -46,7 +46,13 @@ def execute(action, video_id, mode='video', limit=720):
         raise ValueError('Use a non-live video up to ten minutes')
     info = {'id': yt.video_id, 'title': yt.title, 'description': yt.description or '', 'duration': yt.length}
     if action == 'inspect':
-        return {'info': info, 'heights': sorted({height(s) for s in streams if s.includes_video_track and 144 <= height(s) <= 1080}),
+        heights=sorted({height(s) for s in streams if s.includes_video_track and 144<=height(s)<=1080})
+        sizes={}
+        for h in heights:
+            chosen=choose_video(streams,h);parts=[chosen]
+            if not chosen.includes_audio_track and any(s.includes_audio_track and not s.includes_video_track for s in streams):parts.append(choose_audio(streams))
+            if all(s.bitrate and s.bitrate>0 for s in parts):sizes[h]={'bytes':round(sum(s.bitrate for s in parts)*yt.length/8),'estimated':True}
+        return {'info': info, 'heights': heights,'video_sizes':sizes,
                 'has_audio': any(s.includes_audio_track for s in streams)}
     chosen = [choose_audio(streams)] if mode in ('audio', 'mp3') else [choose_video(streams, limit)]
     if mode == 'video' and not chosen[0].includes_audio_track:
