@@ -151,7 +151,7 @@ def run(command, directory, timeout=180, json_output=False):
 
 
 def ytdlp_args():
-    return [sys.executable, '-m', 'yt_dlp', '--ignore-config', '--no-playlist', '--force-ipv4', '--socket-timeout', '15', '--retries', '1', '--extractor-retries', '1', '--js-runtimes', 'node']
+    return [sys.executable, '-m', 'yt_dlp', '--ignore-config', '--no-playlist', '--concurrent-fragments', '4', '--force-ipv4', '--socket-timeout', '15', '--retries', '1', '--extractor-retries', '1', '--js-runtimes', 'node']
 
 
 def youtube_id(url):
