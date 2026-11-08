@@ -38,7 +38,7 @@ pool = ThreadPoolExecutor(max_workers=2)
 transcode_gate = threading.Semaphore(1)
 inspect_pool = ThreadPoolExecutor(max_workers=2)
 delivery_pool = ThreadPoolExecutor(max_workers=2)
-youtube_pool = ThreadPoolExecutor(max_workers=1)
+youtube_pool = ThreadPoolExecutor(max_workers=2)
 source_http = httpx.Client(timeout=15, follow_redirects=False, limits=httpx.Limits(max_connections=12,max_keepalive_connections=8,keepalive_expiry=30))
 telegram_http = httpx.Client(timeout=120, limits=httpx.Limits(max_connections=4,max_keepalive_connections=4,keepalive_expiry=60))
 lock = threading.Lock()
@@ -257,6 +257,7 @@ def spotify_post(url):
 
 def post_info(url, directory):
     validate_source(url)
+    if youtube_id(url):url='https://www.youtube.com/watch?v='+youtube_id(url)
     with cache_lock:
         cached=post_cache.get(url)
         if cached and cached[0]>time.time():return cached[1]
@@ -273,7 +274,15 @@ def post_info(url, directory):
             for key in list(post_cache):
                 if post_cache[key][0]<=time.time():post_cache.pop(key,None)
             if len(post_cache)>=20:post_cache.pop(next(iter(post_cache)),None)
-            post_cache[url]=(time.time()+600,post)
+            ttl=3600 if youtube_id(url) else 600
+            # Signed playback URLs may expire sooner than reusable metadata.
+            for address,_ in post.get('files',[]):
+                if youtube_id(url):
+                    try:
+                        expires=float(parse_qs(urlparse(address).query).get('expire',[''])[0])
+                        if math.isfinite(expires):ttl=min(ttl,max(0,expires-time.time()-120))
+                    except (ValueError,TypeError):pass
+            post_cache[url]=(time.time()+ttl,post)
         return post
 
 
@@ -825,7 +834,8 @@ def direct_items(post,job):
 
 
 def media_key(job):
-    return (job.url,job.mode,job.height)
+    url='https://www.youtube.com/watch?v='+youtube_id(job.url) if youtube_id(job.url or '') else job.url
+    return (url,job.mode,job.height)
 
 
 def notify_completion(job):

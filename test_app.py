@@ -258,6 +258,52 @@ class MediaTests(unittest.TestCase):
             self.assertEqual(app.post_info(url,'unused'),{'engine':'test'})
             self.assertEqual(get.call_count,2)
 
+    def test_youtube_aliases_share_metadata_and_file_cache_until_safe_expiry(self):
+        import concurrent.futures,time
+        aliases=['https://youtu.be/abcdefghijk','https://youtube.com/shorts/abcdefghijk','https://www.youtube.com/watch?v=abcdefghijk']
+        canonical=aliases[-1]
+        post={'engine':'direct','files':[('https://video.googlevideo.com/videoplayback?expire=1180',{})]}
+        def extract(*args):time.sleep(.02);return post
+        with patch.object(app,'_extract_post_info',side_effect=extract) as get,patch.object(app.time,'time',return_value=1000):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=3) as workers:
+                self.assertEqual(list(workers.map(lambda u:app.post_info(u,'unused'),aliases)),[post]*3)
+            self.assertEqual(get.call_count,1)
+            self.assertEqual(get.call_args.args[0],canonical)
+        with patch.object(app,'_extract_post_info',return_value=post) as get,patch.object(app.time,'time',return_value=1030):
+            app.post_info(aliases[0],'unused');get.assert_not_called()
+        with patch.object(app,'_extract_post_info',return_value=post) as get,patch.object(app.time,'time',return_value=1070):
+            app.post_info(aliases[0],'unused');get.assert_called_once()
+        keys=[app.media_key(app.Request(**{**self.job,'url':u,'kind':'download'})) for u in aliases]
+        self.assertEqual(keys[0],keys[1]);self.assertEqual(keys[1],keys[2])
+
+    def test_youtube_metadata_reuses_long_lived_source_after_ten_minutes(self):
+        post={'engine':'direct','files':[('https://video.googlevideo.com/videoplayback?expire=20000',{})]}
+        with patch.object(app,'_extract_post_info',return_value=post) as get:
+            with patch.object(app.time,'time',return_value=1000):app.post_info(self.job['url'],'unused')
+            with patch.object(app.time,'time',return_value=2200):app.post_info(self.job['url'],'unused')
+            self.assertEqual(get.call_count,1)
+            with patch.object(app.time,'time',return_value=4700):app.post_info(self.job['url'],'unused')
+            self.assertEqual(get.call_count,2)
+
+    def test_two_youtube_lookups_can_start_without_waiting_for_each_other(self):
+        import threading
+        release=threading.Event();both=threading.Event();finished=threading.Event();started=[];ended=[];guard=threading.Lock()
+        def work(job):
+            with guard:
+                started.append(job.id)
+                if len(started)==2:both.set()
+            release.wait(3)
+            with guard:
+                ended.append(job.id)
+                if len(ended)==2:finished.set()
+        try:
+            with patch.object(app,'execute',side_effect=work):
+                self.assertEqual(self.client.post('/jobs',headers=self.headers,json=self.job).status_code,200)
+                self.assertEqual(self.client.post('/jobs',headers=self.headers,json={**self.job,'id':'b'*32,'url':'https://youtu.be/12345678901'}).status_code,200)
+                self.assertTrue(both.wait(1),'The second lookup should not queue behind the first')
+        finally:
+            release.set();self.assertTrue(finished.wait(2))
+
     def test_inspection_is_not_blocked_by_download_worker(self):
         import threading
         release=threading.Event();inspected=threading.Event()
