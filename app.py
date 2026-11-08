@@ -739,11 +739,17 @@ def validate_native_duration(paths, post, native, directory):
                 raise MediaError('YouTube supplied an incomplete stream. The download was not sent.')
 
 
+def proxy_audio_error(error):
+    failure=MediaError('The verified recording is temporarily unavailable from the free audio sources.')
+    failure.diagnostic={'source':'audio_proxy','reason':error.reason,'http_status':error.status}
+    return failure
+
+
 def acquire_audio(post,job,directory):
     data=None;paths=[]
     if post['engine']=='proxy-audio':
         try:paths=[download_proxy_audio(post['source_url'],Path(directory)/'verified-source.mp3',source_http,job.mode)]
-        except ProxyAudioUnavailable:raise MediaError('The verified recording is temporarily unavailable from the free audio sources.') from None
+        except ProxyAudioUnavailable as error:raise proxy_audio_error(error) from None
     elif post['engine']=='public-audio':
         target=Path(directory)/'source-audio.m4a'
         try:fetch_file(post['files'][0][0],target,MAX_VIDEO);paths=[target]
@@ -793,7 +799,7 @@ def download_audio(post,job,directory):
         source=post.get('source_url')
         if post['engine']=='proxy-audio' or spotify_input is None or not source or not youtube_id(source) or not post.get('expected_duration'):raise
         try:target=download_proxy_audio(source,Path(directory)/'verified-source.mp3',source_http,job.mode)
-        except ProxyAudioUnavailable:raise MediaError('The verified recording is temporarily unavailable from the free audio sources.') from None
+        except ProxyAudioUnavailable as error:raise proxy_audio_error(error) from None
         paths=[target];post={**post,'engine':'proxy-audio'};data=None
     if post.get('expected_duration'):
         for p in paths:
@@ -998,7 +1004,7 @@ def execute(job):
         message = str(error) if isinstance(error, MediaError) else 'Media processing failed. Try again later or choose a smaller file.'
         with lock:
             jobs[job.id].update(status='error', error=message)
-            if job.kind=='verify':jobs[job.id]['result']={'verification_only':True,'error_type':type(error).__name__}
+            if job.kind=='verify':jobs[job.id]['result']={'verification_only':True,'error_type':type(error).__name__,'diagnostic':getattr(error,'diagnostic',None)}
     finally:
         ready=jobs.get(job.id,{}).get('ready')
         if ready:ready.set()
@@ -1007,7 +1013,7 @@ def execute(job):
 
 @app.get('/health')
 def health():
-    return {'ok': True, 'release': '2026-11-08-audio-fallback'}
+    return {'ok': True, 'release': '2026-11-08-audio-diagnostics'}
 
 
 @app.post('/jobs')

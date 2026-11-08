@@ -14,7 +14,8 @@ TOTAL_SECONDS = 60
 
 
 class ProxyAudioUnavailable(ValueError):
-    pass
+    def __init__(self,message,reason='unavailable',status=None):
+        super().__init__(message);self.reason=reason;self.status=status
 
 
 def download_proxy_audio(source_url, target_path, client, mode='mp3'):
@@ -83,13 +84,14 @@ def download_proxy_audio(source_url, target_path, client, mode='mp3'):
                            params={'wait': 'true', 'download': 'true'},
                            json={'url': 'https://www.youtube.com/watch?v=' + video_id,
                                  'format': 'audio', 'quality': 'best', 'outputFormat': 'mp3'},
-                           headers={'Accept': 'audio/*, application/octet-stream', 'Accept-Encoding': 'identity', 'Connection': 'close'},
+                           headers={'Accept': 'audio/*, application/octet-stream', 'Accept-Encoding': 'identity', 'Connection': 'close',
+                                    'User-Agent':'Mozilla/5.0','Referer':'https://save.brianrianrehan.com/','Origin':'https://save.brianrianrehan.com'},
                            timeout=timeout, follow_redirects=False, extensions={'trace': trace}, auth=None) as response:
             active.append(response)
             check_deadline()
             mime = response.headers.get('content-type', '').split(';', 1)[0].strip().lower()
             if response.status_code != 200 or not (mime.startswith('audio/') or mime == 'application/octet-stream'):
-                raise ProxyAudioUnavailable('The free audio fallback did not return an audio file.')
+                raise ProxyAudioUnavailable('The free audio fallback did not return an audio file.','response',response.status_code)
             encoding = response.headers.get('content-encoding', 'identity').lower()
             if encoding != 'identity':
                 raise ProxyAudioUnavailable('The free audio fallback returned an unsupported encoding.')
@@ -114,8 +116,8 @@ def download_proxy_audio(source_url, target_path, client, mode='mp3'):
         return target
     except ProxyAudioUnavailable:
         raise
-    except Exception:
-        raise ProxyAudioUnavailable('The free audio fallback is temporarily unavailable.') from None
+    except Exception as error:
+        raise ProxyAudioUnavailable('The free audio fallback is temporarily unavailable.',type(error).__name__) from None
     finally:
         timer.cancel()
         active.clear()
