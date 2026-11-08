@@ -261,4 +261,14 @@ class MediaTests(unittest.TestCase):
         self.assertEqual(api.call_args.args[2],{})
         self.assertEqual(api.call_args.args[1]['caption_entities'][0]['url'],url)
 
+
+    def test_deezer_catalog_rejects_wrong_artist_and_version(self):
+        entity={'title':'Cheshme Man','artists':[{'name':'Dariush'}],'duration':297080}
+        tracks=[{'id':1,'title':'Cheshme Man','artist':{'name':'Someone else'},'duration':297},
+          {'id':2,'title':'Cheshme Man','artist':{'name':'Dariush'},'duration':248},
+          {'id':12582488,'title':'Cheshme Man','artist':{'name':'Dariush'},'duration':297,'preview':'https://cdn.example.org/preview.mp3'}]
+        response=httpx.Response(200,json={'data':tracks},request=httpx.Request('GET','https://api.deezer.com/search'))
+        with patch.object(app.httpx,'get',return_value=response):match=app.deezer_catalog_match(entity)
+        self.assertEqual(match['id'],12582488)
+
 if __name__=='__main__':unittest.main()

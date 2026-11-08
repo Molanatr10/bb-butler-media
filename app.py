@@ -196,6 +196,25 @@ def fallback_stream_url(post,format):
     return FALLBACK_BASE+'/latest_version?'+urlencode({'id':post['video_id'],'itag':itag,'local':'true'})
 
 
+def deezer_catalog_match(entity):
+    title=str(entity.get('title') or '')
+    artist=next(iter(entity.get('artists') or []),{}).get('name','')
+    expected=float(entity.get('duration') or 0)/1000
+    if not title or not artist:return None
+    response=httpx.get('https://api.deezer.com/search',params={'q':artist+' '+title,'limit':10},timeout=6)
+    response.raise_for_status();tracks=response.json().get('data') or []
+    normalize=lambda text:' '.join(re.findall(r'\w+',str(text).casefold()))
+    candidates=[]
+    for track in tracks:
+        if normalize(track.get('title'))!=normalize(title):continue
+        if normalize((track.get('artist') or {}).get('name'))!=normalize(artist):continue
+        duration=float(track.get('duration') or 0)
+        if expected and abs(duration-expected)>max(5,expected*.02):continue
+        if not track.get('id'):continue
+        candidates.append((abs(duration-expected),track['id'],track))
+    return min(candidates,key=lambda row:row[:2])[2] if candidates else None
+
+
 def spotify_post(url):
     if urlparse(url).hostname=='spotify.link':
         with httpx.Client(follow_redirects=False,timeout=15) as client:
@@ -215,7 +234,9 @@ def spotify_post(url):
     entity=json.loads(match.group(1)).get('props',{}).get('pageProps',{}).get('state',{}).get('data',{}).get('entity',{})
     if not entity.get('title'):raise MediaError('Spotify could not identify this item.')
     title=str(entity['title']);artist=', '.join(a.get('name','') for a in (entity.get('artists') or []))
-    return {'engine':'spotify','info':{'title':f'{artist} — {title}' if artist else title,'description':f'{artist} — {title}' if artist else title},'entity':entity,'url':url}
+    try:deezer=deezer_catalog_match(entity)
+    except (httpx.HTTPError,ValueError,TypeError):deezer=None
+    return {'engine':'spotify','info':{'title':f'{artist} — {title}' if artist else title,'description':f'{artist} — {title}' if artist else title},'entity':entity,'url':url,'deezer':deezer}
 
 
 def post_info(url, directory):
@@ -369,7 +390,7 @@ def metadata(post):
         has_video=bool(heights);has_audio=any(str(f.get('type','')).startswith('audio/') for f in post['formats'])
     elif post['engine']=='spotify':
         return {'title':title,'caption':caption,'language':language,'media_type':'audio','has_video':False,'has_audio':True,'heights':[],
-          'audio_modes':(['preview'] if (post['entity'].get('audioPreview') or {}).get('url') else [])+['audio','mp3'],'spotify_match':True}
+          'audio_modes':(['preview'] if (post.get('deezer') or {}).get('preview') or (post['entity'].get('audioPreview') or {}).get('url') else [])+['audio','mp3'],'spotify_match':True,'catalog_source':'Deezer' if post.get('deezer') else 'Spotify','preview_source':'Deezer' if (post.get('deezer') or {}).get('preview') else 'Spotify'}
     else:
         has_video = any(str(meta.get('extension') or '').lower() in ('mp4', 'webm', 'mov') for _, meta in post['files'])
         heights = post.get('heights',[] if post.get('original_only') else [360,480,720,1080] if has_video else [])
@@ -518,11 +539,13 @@ def spotify_public_recording(post,directory):
 def download_audio(post,job,directory):
     if post['engine']=='spotify':
         if job.mode=='preview':
-            url=(post['entity'].get('audioPreview') or {}).get('url')
+            url=(post.get('deezer') or {}).get('preview') or (post['entity'].get('audioPreview') or {}).get('url')
             if not url:raise MediaError('Spotify does not provide a preview for this item.')
             target=Path(directory)/'spotify-preview.mp3';fetch_file(url,target,MAX_IMAGE)
             return [('audio',target)]
         original=post
+        if post.get('deezer'):
+            original={**post,'entity':{**post['entity'],'title':post['deezer']['title'],'artists':[{'name':post['deezer']['artist']['name']}],'duration':post['deezer']['duration']*1000}}
         try:post=spotify_public_recording(original,directory)
         except (MediaError,httpx.HTTPError,ValueError):post=spotify_recording(original,directory)
     paths=[]

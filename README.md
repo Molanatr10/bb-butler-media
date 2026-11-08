@@ -21,3 +21,6 @@ Public source helpers: Twitter syndication provides text-only posts, images and 
 
 
 For eligible public video/image posts, delivery first asks Telegram to fetch the public media URL directly, avoiding server downloads and encoding. Successful sends populate the Telegram file-ID cache. Only an unambiguous HTTP 400 failure before any items were sent falls back to local processing; partial albums and uncertain network outcomes are never replayed automatically. TikTok uses its standard public MP4 for lower transfer latency. Tweet author names link to the original tweet above its text or caption.
+
+
+Spotify matching also consults Deezer’s public catalog, requiring matching artist/title and a close duration before accepting a catalog record. Deezer previews are labeled as short clips; catalog metadata does not provide full-track audio or access to @DeezerMusicBot’s private library. No Deezer account credentials or DRM-unlocking code are used.
