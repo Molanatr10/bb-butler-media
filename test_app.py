@@ -39,17 +39,43 @@ class MediaTests(unittest.TestCase):
         with self.assertRaises(ValueError):choose_video([large],360)
 
     def test_native_youtube_merges_audio_and_normalizes_output(self):
-        post={'engine':'youtube-native'}
+        post={'engine':'youtube-native','info':{'duration':65}}
         job=app.Request(**{**self.job,'kind':'download','height':360})
-        with tempfile.TemporaryDirectory() as directory,patch.object(app,'youtube_native',return_value={'files':['native-0.mp4','native-1.m4a']}),patch.object(app,'run') as command,patch.object(app,'normalize_video',return_value=Path(directory)/'output.mp4'):
+        with tempfile.TemporaryDirectory() as directory,patch.object(app,'youtube_native',return_value={'files':['native-0.mp4','native-1.m4a']}),patch.object(app,'run',return_value={'format':{'duration':'65.1'}}) as command,patch.object(app,'normalize_video',return_value=Path(directory)/'output.mp4'):
             self.assertEqual(app.download(post,job,directory)[0][0],'video')
-            self.assertIn('copy',command.call_args.args[0])
+            self.assertTrue(any('copy' in call.args[0] for call in command.call_args_list))
+
+    def test_native_youtube_rejects_truncated_valid_video_and_audio(self):
+        post={'engine':'youtube-native','info':{'duration':60}}
+        for mode in ('video','mp3'):
+            with self.subTest(mode=mode),tempfile.TemporaryDirectory() as directory,patch.object(app,'youtube_native',return_value={'files':['native-0.mp4']}),patch.object(app,'normalize_video',return_value=Path(directory)/'output.mp4'),patch.object(app,'normalize_audio',return_value=Path(directory)/'output.mp3'),patch.object(app,'run',return_value={'format':{'duration':'30'}}):
+                job=app.Request(**{**self.job,'kind':'download','mode':mode})
+                with self.assertRaisesRegex(app.MediaError,'incomplete stream'):app.download(post,job,directory)
+
+    def test_native_youtube_duration_checks_individual_streams_and_tolerates_container_padding(self):
+        post={'engine':'youtube-native','info':{'duration':60}}
+        with patch.object(app,'run',return_value={'format':{'duration':'60.2'},'streams':[{'codec_type':'video','duration':'60.1'},{'codec_type':'audio','duration':'30'}]}):
+            with self.assertRaisesRegex(app.MediaError,'incomplete stream'):app.validate_native_duration([Path('result.mp4')],post,{},'unused')
+        with patch.object(app,'run',return_value={'format':{'duration':'60.2'},'streams':[{'codec_type':'audio','duration':'60.1'}]}):
+            app.validate_native_duration([Path('result.mp3')],post,{},'unused')
 
     def test_social_delivery_does_not_wait_for_youtube_download_pool(self):
         job={**self.job,'kind':'download','url':'https://x.com/AdiiiFCB/status/2119524707880030446'}
         with patch.object(app.delivery_pool,'submit') as fast,patch.object(app.pool,'submit') as slow:
             self.assertEqual(self.client.post('/jobs',headers=self.headers,json=job).status_code,200)
             self.assertEqual(fast.call_count,1);slow.assert_not_called()
+            audio={**job,'id':'d'*32,'mode':'mp3'}
+            self.assertEqual(self.client.post('/jobs',headers=self.headers,json=audio).status_code,200)
+            self.assertEqual(slow.call_count,1);self.assertEqual(fast.call_count,1)
+
+    def test_native_spotify_fallback_uses_resolved_youtube_url_and_checks_duration(self):
+        url='https://www.youtube.com/watch?v=abcdefghijk'
+        post={'engine':'spotify','entity':{}}
+        resolved={'engine':'youtube-native','source_url':url,'expected_duration':200}
+        job=app.Request(**{**self.job,'kind':'download','mode':'mp3','url':'https://open.spotify.com/track/11dFghVXANMlKmJXsNCbNl'})
+        with tempfile.TemporaryDirectory() as directory,patch.object(app,'spotify_public_recording',side_effect=app.MediaError('missing')),patch.object(app,'spotify_recording',return_value=resolved),patch.object(app,'youtube_native',return_value={'files':['native-0.m4a']}) as native,patch.object(app,'run',return_value={'format':{'duration':'30'}}),patch.object(app,'normalize_audio') as normalize:
+            with self.assertRaises(app.MediaError):app.download_audio(post,job,directory)
+            self.assertEqual(native.call_args.args[0],url);normalize.assert_not_called()
 
     def setUp(self):
         self.client=TestClient(app.app)

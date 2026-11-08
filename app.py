@@ -555,10 +555,23 @@ def spotify_public_recording(post,directory):
     raise MediaError('No matching openly playable full recording was found. The Spotify preview remains a separate short-clip option.')
 
 
+def validate_native_duration(paths, post, native, directory):
+    expected=float((post.get('info') or {}).get('duration') or (native.get('info') or {}).get('duration') or post.get('expected_duration') or 0)
+    if not math.isfinite(expected) or expected<=0:
+        raise MediaError('YouTube did not supply a valid duration. The download was not sent.')
+    tolerance=max(3,expected*.03)
+    for path in paths:
+        probe=run(['ffprobe','-v','error','-show_entries','format=duration:stream=codec_type,duration','-of','json',str(path)],directory,json_output=True)
+        durations=[probe.get('format',{}).get('duration')]
+        durations.extend(s.get('duration') for s in probe.get('streams',[]) if s.get('codec_type') in ('video','audio') and s.get('duration') not in (None,'N/A'))
+        for duration in durations:
+            try:actual=float(duration)
+            except (TypeError,ValueError):actual=0
+            if not math.isfinite(actual) or actual<=0 or abs(actual-expected)>tolerance:
+                raise MediaError('YouTube supplied an incomplete stream. The download was not sent.')
+
+
 def download_audio(post,job,directory):
-    if post['engine']=='youtube-native':
-        data=youtube_native(job.url,directory,job.mode)
-        return [('audio',normalize_audio(Path(directory)/data['files'][0],job.mode,directory,0))]
     if post['engine']=='spotify':
         if job.mode=='preview':
             url=(post.get('deezer') or {}).get('preview') or (post['entity'].get('audioPreview') or {}).get('url')
@@ -571,7 +584,10 @@ def download_audio(post,job,directory):
         try:post=spotify_public_recording(original,directory)
         except (MediaError,httpx.HTTPError,ValueError):post=spotify_recording(original,directory)
     paths=[]
-    if post['engine']=='invidious':
+    if post['engine']=='youtube-native':
+        data=youtube_native(post.get('source_url') or job.url,directory,job.mode)
+        paths=[Path(directory)/data['files'][0]]
+    elif post['engine']=='invidious':
         choices=[f for f in post['formats'] if str(f.get('type','')).startswith('audio/') and f.get('url')]
         if not choices:raise MediaError('No audio stream was found for this video.')
         selected=max(choices,key=lambda f:(str(f.get('type','')).startswith('audio/mp4'),int(f.get('bitrate') or 0)))
@@ -587,14 +603,16 @@ def download_audio(post,job,directory):
         for p in paths:
             probe=run(['ffprobe','-v','error','-show_entries','format=duration','-of','json',str(p)],directory,json_output=True)
             if abs(float(probe.get('format',{}).get('duration') or 0)-post['expected_duration'])>max(12,post['expected_duration']*.06):raise MediaError('The public source only supplied a preview or a different version. Full audio was not sent.')
-    return [('audio',normalize_audio(p,job.mode,directory,i)) for i,p in enumerate(paths)]
+    normalized=[('audio',normalize_audio(p,job.mode,directory,i)) for i,p in enumerate(paths)]
+    if post['engine']=='youtube-native':validate_native_duration([p for _,p in normalized],post,data,directory)
+    return normalized
 
 
 def download(post, job, directory):
     if job.mode in ('audio','mp3','preview'):return download_audio(post,job,directory)
     paths = []
     if post['engine']=='youtube-native':
-        data=youtube_native(job.url,directory,'video',job.height)
+        data=youtube_native(post.get('source_url') or job.url,directory,'video',job.height)
         paths=[Path(directory)/name for name in data['files']]
         if len(paths)==2:
             merged=Path(directory)/'video-merged.mkv'
@@ -641,6 +659,7 @@ def download(post, job, directory):
             with Image.open(p) as im:
                 im = ImageOps.exif_transpose(im).convert('RGB'); im.thumbnail((2560, 2560)); im.save(target, 'JPEG', quality=90)
             normalized.append(('photo', target))
+    if post['engine']=='youtube-native':validate_native_duration([p for _,p in normalized],post,data,directory)
     return normalized
 
 
@@ -797,6 +816,6 @@ def submit(job: Request, authorization: str = Header(default='')):
         with cache_lock:cached=file_cache.get(media_key(job)) if job.kind=='download' else None
         host=(urlparse(job.url or '').hostname or '').removeprefix('www.')
         direct_source=host in ('x.com','twitter.com','mobile.twitter.com','instagram.com','tiktok.com','m.tiktok.com','vm.tiktok.com','vt.tiktok.com')
-        executor=(youtube_pool if youtube_id(job.url or '') else inspect_pool) if job.kind=='inspect' else delivery_pool if cached and cached[0]>time.time() or job.kind=='download' and direct_source else pool
+        executor=(youtube_pool if youtube_id(job.url or '') else inspect_pool) if job.kind=='inspect' else delivery_pool if cached and cached[0]>time.time() or job.kind=='download' and direct_source and job.mode in ('video','images') else pool
         executor.submit(execute, job)
     return {'status': 'running'}
