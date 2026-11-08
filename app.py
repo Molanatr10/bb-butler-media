@@ -30,7 +30,8 @@ MAX_VIDEO = 45 * 1024 * 1024
 MAX_IMAGE = 10 * 1024 * 1024
 ALLOWED_CHAT = int(os.environ.get('ALLOWED_CHAT_ID', '0'))
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
-pool = ThreadPoolExecutor(max_workers=1)
+pool = ThreadPoolExecutor(max_workers=2)
+transcode_gate = threading.Semaphore(1)
 inspect_pool = ThreadPoolExecutor(max_workers=2)
 lock = threading.Lock()
 jobs = {}
@@ -119,8 +120,10 @@ def run(command, directory, timeout=180, json_output=False):
     output = Path(directory) / 'command-output.json'
     errors = Path(directory) / 'command-errors.txt'
     try:
-        with open(output, 'wb') as f, open(errors, 'wb') as stderr:
-            result = subprocess.run(command, cwd=directory, stdout=f, stderr=stderr, timeout=timeout, check=False)
+        transcode=command[0]=='ffmpeg' and any(codec in command for codec in ('libx264','libmp3lame','aac'))
+        with transcode_gate if transcode else contextlib.nullcontext():
+            with open(output, 'wb') as f, open(errors, 'wb') as stderr:
+                result = subprocess.run(command, cwd=directory, stdout=f, stderr=stderr, timeout=timeout, check=False)
         if result.returncode:
             reason=errors.read_text(encoding='utf-8',errors='replace')[-65536:].lower()
             if 'sign in to confirm' in reason or 'confirm you’re not a bot' in reason:
@@ -634,7 +637,7 @@ def notify_completion(job):
 
 
 def execute(job):
-    began=time.monotonic();timings={}
+    began=time.monotonic();timings={'queue_ms':round((time.time()-jobs.get(job.id,{}).get('created',time.time()))*1000)}
     try:
         with tempfile.TemporaryDirectory(prefix='bb-media-') as directory:
             if job.kind == 'sticker':
@@ -706,5 +709,6 @@ def submit(job: Request, authorization: str = Header(default='')):
         if sum(j['status'] == 'running' for j in jobs.values()) >= 5:
             raise HTTPException(429, 'Queue full')
         jobs[job.id] = {'status': 'running', 'created': time.time(), 'fingerprint': fingerprint}
-        (inspect_pool if job.kind=='inspect' else pool).submit(execute, job)
+        with cache_lock:cached=file_cache.get(media_key(job)) if job.kind=='download' else None
+        (inspect_pool if job.kind=='inspect' or cached and cached[0]>time.time() else pool).submit(execute, job)
     return {'status': 'running'}

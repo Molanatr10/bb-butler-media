@@ -182,12 +182,14 @@ class MediaTests(unittest.TestCase):
     def test_inspection_is_not_blocked_by_download_worker(self):
         import threading
         release=threading.Event();inspected=threading.Event()
-        blocked=app.pool.submit(release.wait)
+        blocked=[app.pool.submit(release.wait) for _ in range(2)]
         try:
             with patch.object(app,'execute',side_effect=lambda job:inspected.set()):
                 self.assertEqual(self.client.post('/jobs',headers=self.headers,json=self.job).status_code,200)
                 self.assertTrue(inspected.wait(1),'inspection waited behind download')
-        finally:release.set();blocked.result(timeout=2)
+        finally:
+            release.set()
+            for task in blocked:task.result(timeout=2)
 
     def test_instagram_captioned_embed_and_original_video(self):
         context={'context':{'copyright_blocked':False},'gql_data':{'shortcode_media':{'shortcode':'AbCd123','video_url':'https://cdn.example.org/movie.mp4','edge_media_to_caption':{'edges':[{'node':{'text':'Original caption'}}]}}}}
