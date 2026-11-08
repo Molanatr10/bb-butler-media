@@ -42,6 +42,7 @@ class Request(BaseModel):
     id: str = Field(pattern=r'^[a-f0-9]{32}$')
     kind: str = Field(pattern=r'^(inspect|download|sticker)$')
     chat_id: int
+    user_id: int | None = None
     message_id: int = Field(gt=0)
     topic: int = Field(default=0, ge=0)
     url: str | None = Field(default=None, max_length=2048)
@@ -104,10 +105,20 @@ def fetch_file(url, target, limit, headers=None):
 
 def run(command, directory, timeout=180, json_output=False):
     output = Path(directory) / 'command-output.json'
+    errors = Path(directory) / 'command-errors.txt'
     try:
-        with open(output, 'wb') as f:
-            result = subprocess.run(command, cwd=directory, stdout=f, stderr=subprocess.DEVNULL, timeout=timeout, check=False)
+        with open(output, 'wb') as f, open(errors, 'wb') as stderr:
+            result = subprocess.run(command, cwd=directory, stdout=f, stderr=stderr, timeout=timeout, check=False)
         if result.returncode:
+            reason=errors.read_text(encoding='utf-8',errors='replace')[-65536:].lower()
+            if 'sign in to confirm' in reason or 'confirm you’re not a bot' in reason:
+                raise MediaError('YouTube is blocking requests from this cloud server and requires sign-in. This video cannot currently be downloaded here.')
+            if 'http error 429' in reason or 'too many requests' in reason:
+                raise MediaError('The source site is rate-limiting this cloud server. Please try again later.')
+            if 'login required' in reason or 'login-required' in reason or 'cookies are needed' in reason:
+                raise MediaError('This post requires source-site login and cannot be downloaded anonymously.')
+            if 'certificate_verify_failed' in reason or 'certificate verify failed' in reason:
+                raise MediaError('The media server could not verify the source site’s TLS certificate.')
             raise MediaError('This post could not be downloaded. It may require login, be unavailable, or be blocked by the source site.')
         if output.stat().st_size > 8 * 1024 * 1024:
             raise MediaError('This post contains too much media.')
@@ -118,7 +129,7 @@ def run(command, directory, timeout=180, json_output=False):
 
 
 def ytdlp_args():
-    return [sys.executable, '-m', 'yt_dlp', '--ignore-config', '--no-playlist', '--socket-timeout', '15', '--retries', '1', '--extractor-retries', '1', '--js-runtimes', 'node']
+    return [sys.executable, '-m', 'yt_dlp', '--ignore-config', '--no-playlist', '--force-ipv4', '--socket-timeout', '15', '--retries', '1', '--extractor-retries', '1', '--js-runtimes', 'node']
 
 
 def post_info(url, directory):
@@ -323,7 +334,7 @@ def submit(job: Request, authorization: str = Header(default='')):
     secret = os.environ.get('MEDIA_BACKEND_SECRET', '')
     if len(secret) < 32 or not hmac.compare_digest(authorization, f'Bearer {secret}'):
         raise HTTPException(401, 'Unauthorized')
-    if job.chat_id != ALLOWED_CHAT:
+    if job.chat_id != ALLOWED_CHAT and not (job.chat_id>0 and job.user_id==job.chat_id):
         raise HTTPException(403, 'Group not allowed')
     if job.kind != 'sticker':
         try: validate_source(job.url)

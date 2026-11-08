@@ -34,6 +34,12 @@ class MediaTests(unittest.TestCase):
         app.jobs['a'*32].update(status='done',result={'heights':[360]})
         self.assertEqual(self.client.post('/jobs',headers=self.headers,json=self.job).json()['result'],{'heights':[360]})
 
+    def test_private_jobs_require_matching_telegram_user(self):
+        with patch.object(app.pool,'submit'):
+            private={**self.job,'chat_id':123,'user_id':123}
+            self.assertEqual(self.client.post('/jobs',headers=self.headers,json=private).status_code,200)
+            self.assertEqual(self.client.post('/jobs',headers=self.headers,json={**private,'id':'c'*32,'user_id':999}).status_code,403)
+
     def test_sticker_dimensions_alpha_and_size(self):
         for size in [(1800,1000),(100,300),(250,250)]:
             with tempfile.TemporaryDirectory() as directory:
@@ -83,6 +89,13 @@ class MediaTests(unittest.TestCase):
     def test_private_cdn_addresses_are_blocked(self):
         with patch.object(app.socket,'getaddrinfo',return_value=[(2,1,6,'',('127.0.0.1',443))]):
             with self.assertRaises(app.MediaError):app.public_url('https://cdn.example.org/video.mp4')
+
+    def test_source_login_failure_reports_cause_without_exposing_raw_stderr(self):
+        import sys
+        with tempfile.TemporaryDirectory() as directory:
+            command=[sys.executable,'-c',"import sys;sys.stderr.write('Sign in to confirm you are not a bot; private source detail');sys.exit(1)"]
+            with self.assertRaisesRegex(app.MediaError,'YouTube is blocking') as error:app.run(command,directory)
+            self.assertNotIn('private source detail',str(error.exception))
 
     def test_video_duration_rejected_without_silent_truncation(self):
         with tempfile.TemporaryDirectory() as directory:
