@@ -24,6 +24,7 @@ from langdetect import detect, DetectorFactory
 from PIL import Image, ImageOps
 from pydantic import BaseModel, ConfigDict, Field
 from youtube_public import omega_post, PublicYouTubeError
+from youtube_audio_public import public_audio_post, PublicAudioUnavailable
 
 DetectorFactory.seed = 0
 Image.MAX_IMAGE_PIXELS = 25_000_000
@@ -494,36 +495,66 @@ def normalize_audio(source, mode, directory, index):
     return output
 
 
-def spotify_recording(post,directory):
+def recording_duration_matches(actual, expected):
+    try:actual,expected=float(actual or 0),float(expected or 0)
+    except (TypeError,ValueError):return False
+    return all(math.isfinite(v) and 0<v<=600 for v in (actual,expected)) and abs(actual-expected)<=max(3,expected*.01)
+
+
+def recording_variant_mismatch(recording, expected_title):
+    from urllib.parse import unquote
+    normalize=lambda text:' '.join(re.findall(r'\w+',unquote(str(text)).casefold()))
+    expected=normalize(expected_title)
+    actual=' '.join(normalize(recording.get(key) or '') for key in ('title','track','webpage_url','url'))
+    # Titles and URL slugs are strong version signals. Descriptions can mention
+    # unrelated recommended versions, so do not reject based on their prose.
+    markers=[r'\bslowed(?:down)?\b',r'\b(?:sped(?:up)?|speedup)\b|\bspeed up\b',
+             r'\b(?:remix|slowremix)\b',r'\blive\b',r'\bcover\b',r'\bkaraoke\b']
+    return any(re.search(marker,actual) and not re.search(marker,expected) for marker in markers)
+
+
+def spotify_recording(post,directory,official_only=False):
     entity=post['entity'];title=str(entity.get('title') or '');artists=' '.join(a.get('name','') for a in (entity.get('artists') or []))
     query=f'{artists} {title} official audio'.strip();entries=[]
-    if FALLBACK_BASE:
+    try:
+        data=run(ytdlp_args()+['--flat-playlist','--dump-single-json','--',f'ytsearch5:{query}'],directory,timeout=12,json_output=True)
+        entries=data.get('entries',[])
+    except (MediaError,ValueError):pass
+    if not entries and FALLBACK_BASE:
         try:
-            response=source_http.get(FALLBACK_BASE+'/api/v1/search',params={'q':query,'type':'video'},headers={'User-Agent':'Mozilla/5.0','Referer':FALLBACK_BASE+'/'},timeout=20)
+            response=source_http.get(FALLBACK_BASE+'/api/v1/search',params={'q':query,'type':'video'},headers={'User-Agent':'Mozilla/5.0','Referer':FALLBACK_BASE+'/'},timeout=5)
             if response.is_success:entries=response.json()[:10]
         except (httpx.HTTPError,ValueError):pass
-    if not entries:
-        data=run(ytdlp_args()+['--flat-playlist','--dump-single-json','--',f'ytsearch5:{query}'],directory,json_output=True)
-        entries=data.get('entries',[])
     normalize=lambda text:' '.join(re.findall(r'\w+',str(text).casefold()))
     expected_duration=float(entity.get('duration') or 0)/1000
     ranked=[]
     for entry in entries:
         candidate=str(entry.get('title') or '');by=str(entry.get('author') or entry.get('channel') or '')
         duration=float(entry.get('lengthSeconds') or entry.get('duration') or 0)
-        if duration>600 or expected_duration and duration and abs(duration-expected_duration)>max(15,expected_duration*.12):continue
+        if not recording_duration_matches(duration,expected_duration) or recording_variant_mismatch(entry,title):continue
         primary=normalize(next(iter(entity.get('artists') or []),{}).get('name',''))
+        official_artist=bool(entry.get('channel_is_verified')) and normalize(by)==primary
+        if official_only and not official_artist:continue
         artist_match=not primary or primary in normalize(candidate+' '+by)
         if not artist_match:continue
-        title_match=normalize(title) in normalize(candidate)
+        title_match=(' '+normalize(title)+' ') in (' '+normalize(candidate)+' ')
+        if official_only and not title_match:continue
         score=.8 if title_match else .8*SequenceMatcher(None,normalize(title),normalize(candidate)).ratio()
         if primary:score+=.2
-        if any(word in candidate.lower() and word not in title.lower() for word in ['cover','remix','live','karaoke','sped up','slowed']):score-=.4
+        if official_artist:score+=.1
         identifier=entry.get('videoId') or entry.get('id')
         if re.fullmatch(r'[\w-]{11}',identifier or ''):ranked.append((score,identifier))
     if not ranked or max(ranked)[0]<.65:raise MediaError('No confident public recording match was found for this Spotify track. Try its preview or send a direct video link.')
     url='https://www.youtube.com/watch?v='+max(ranked)[1]
-    recording=dict(post_info(url,directory));recording['source_url']=url
+    recording=None
+    if official_only:
+        try:recording=public_audio_post(url,source_http,expected_duration,budget=3)
+        except (PublicAudioUnavailable,httpx.HTTPError,ValueError):pass
+    if recording is None:recording=dict(post_info(url,directory))
+    recording['source_url']=url;recording['expected_duration']=expected_duration
+    resolved={**recording.get('info',{}),'webpage_url':url}
+    if recording_variant_mismatch(resolved,title) or not recording_duration_matches(resolved.get('duration'),expected_duration):
+        raise MediaError('The public source did not match this Spotify recording closely enough. Full audio was not sent.')
     return recording
 
 
@@ -545,15 +576,14 @@ def spotify_public_recording(post,directory):
     for entry in search.get('entries',[]):
         candidate=normalize(entry.get('title',''));by=normalize(entry.get('uploader',''))
         duration=float(entry.get('duration') or 0)
-        if not expected or abs(duration-expected)>max(12,expected*.06):continue
-        if normalize(title) not in candidate or normalize(artists) not in candidate+' '+by:continue
-        if any(w in candidate and w not in normalize(title) for w in ['remix','live','cover','karaoke','sped','slowed']):continue
+        if not recording_duration_matches(duration,expected) or recording_variant_mismatch(entry,title):continue
+        if (' '+normalize(title)+' ') not in (' '+candidate+' ') or normalize(artists) not in candidate+' '+by:continue
         address=entry.get('webpage_url') or ''
         if urlparse(address).hostname not in ('soundcloud.com','www.soundcloud.com'):continue
         try:
             info=run(ytdlp_args()+['--dump-single-json','--skip-download','--',address],directory,timeout=20,json_output=True)
         except MediaError:continue  # Login-only/DRM recordings are never unlocked.
-        if not info.get('formats'):continue
+        if not info.get('formats') or not recording_duration_matches(info.get('duration'),expected) or recording_variant_mismatch({**info,'webpage_url':address},title):continue
         return {'engine':'yt-dlp','info':info,'entries':[info],'source_url':address,'expected_duration':expected}
     raise MediaError('No matching openly playable full recording was found. The Spotify preview remains a separate short-clip option.')
 
@@ -575,19 +605,25 @@ def validate_native_duration(paths, post, native, directory):
 
 
 def download_audio(post,job,directory):
+    spotify_input=None
     if post['engine']=='spotify':
         if job.mode=='preview':
             url=(post.get('deezer') or {}).get('preview') or (post['entity'].get('audioPreview') or {}).get('url')
             if not url:raise MediaError('Spotify does not provide a preview for this item.')
             target=Path(directory)/'spotify-preview.mp3';fetch_file(url,target,MAX_IMAGE)
             return [('audio',target)]
-        original=post
+        spotify_input=post;original=post
         if post.get('deezer'):
             original={**post,'entity':{**post['entity'],'title':post['deezer']['title'],'artists':[{'name':post['deezer']['artist']['name']}],'duration':post['deezer']['duration']*1000}}
-        try:post=spotify_public_recording(original,directory)
-        except (MediaError,httpx.HTTPError,ValueError):post=spotify_recording(original,directory)
+        with cache_lock:recording=spotify_input.get('recording')
+        if recording and recording[0]>time.time():post=dict(recording[1])
+        else:
+            try:post=spotify_recording(original,directory,official_only=True)
+            except (MediaError,httpx.HTTPError,ValueError):post=spotify_public_recording(original,directory)
     paths=[]
-    if post['engine']=='youtube-native':
+    if post['engine']=='public-audio':
+        target=Path(directory)/'source-audio.m4a';fetch_file(post['files'][0][0],target,MAX_VIDEO);paths=[target]
+    elif post['engine']=='youtube-native':
         data=youtube_native(post.get('source_url') or job.url,directory,job.mode)
         paths=[Path(directory)/data['files'][0]]
     elif post['engine']=='invidious':
@@ -600,14 +636,16 @@ def download_audio(post,job,directory):
         run(ytdlp_args()+['--max-filesize','45M','-f','ba/b','-o',str(Path(directory)/'source-audio-%(autonumber)03d.%(ext)s'),*native_input(post,post.get('source_url') or job.url,directory)],directory,timeout=180)
         paths=sorted(p for p in Path(directory).glob('source-audio-*') if p.suffix in ('.m4a','.mp3','.webm','.mp4','.ogg','.opus'))
     else:
-        return [('audio',normalize_audio(path,job.mode,directory,i)) for i,(kind,path) in enumerate(download(post,job.model_copy(update={'mode':'video'}),directory)) if kind=='video']
+        paths=[path for kind,path in download(post,job.model_copy(update={'mode':'video','url':post.get('source_url') or job.url}),directory) if kind=='video']
     if not paths:raise MediaError('No downloadable audio was found.')
     if post.get('expected_duration'):
         for p in paths:
             probe=run(['ffprobe','-v','error','-show_entries','format=duration','-of','json',str(p)],directory,json_output=True)
-            if abs(float(probe.get('format',{}).get('duration') or 0)-post['expected_duration'])>max(12,post['expected_duration']*.06):raise MediaError('The public source only supplied a preview or a different version. Full audio was not sent.')
+            if not recording_duration_matches(probe.get('format',{}).get('duration'),post['expected_duration']):raise MediaError('The public source only supplied a preview or a different version. Full audio was not sent.')
     normalized=[('audio',normalize_audio(p,job.mode,directory,i)) for i,p in enumerate(paths)]
     if post['engine']=='youtube-native':validate_native_duration([p for _,p in normalized],post,data,directory)
+    if spotify_input is not None:
+        with cache_lock:spotify_input['recording']=(time.time()+180,dict(post))
     return normalized
 
 
@@ -760,6 +798,7 @@ def execute(job):
                         with cache_lock:file_cache.pop(media_key(job),None)
                         raise
                     with lock:jobs[job.id].update(status='done',result=result)
+                    result['timings_ms']={**timings,'total_ms':round((time.monotonic()-began)*1000)}
                     return
                 post = post_info(job.url, directory)
                 timings['lookup_ms']=round((time.monotonic()-began)*1000)
@@ -785,6 +824,8 @@ def execute(job):
         with lock:
             jobs[job.id].update(status='error', error=message)
     finally:
+        ready=jobs.get(job.id,{}).get('ready')
+        if ready:ready.set()
         notify_completion(job)
 
 
@@ -815,10 +856,19 @@ def submit(job: Request, authorization: str = Header(default='')):
             return {k: existing[k] for k in ('status', 'result', 'error') if k in existing}
         if sum(j['status'] == 'running' for j in jobs.values()) >= 5:
             raise HTTPException(429, 'Queue full')
-        jobs[job.id] = {'status': 'running', 'created': time.time(), 'fingerprint': fingerprint}
+        ready=threading.Event()
+        jobs[job.id] = {'status': 'running', 'created': time.time(), 'fingerprint': fingerprint, 'ready':ready}
         with cache_lock:cached=file_cache.get(media_key(job)) if job.kind=='download' else None
         host=(urlparse(job.url or '').hostname or '').removeprefix('www.')
         direct_source=host in ('x.com','twitter.com','mobile.twitter.com','instagram.com','tiktok.com','m.tiktok.com','vm.tiktok.com','vt.tiktok.com')
         executor=(youtube_pool if youtube_id(job.url or '') else inspect_pool) if job.kind=='inspect' else delivery_pool if cached and cached[0]>time.time() or job.kind=='download' and direct_source and job.mode in ('video','images') else pool
         executor.submit(execute, job)
+    # Fast inspections and Telegram sends can finish during the request. Return
+    # their receipt immediately instead of forcing a callback/poll round trip.
+    # Never hold the jobs lock while waiting for the executor to finish.
+    if (job.kind=='inspect' and not youtube_id(job.url or '')) or job.kind=='download' and (cached and cached[0]>time.time() or direct_source and job.mode in ('video','images')):
+        if ready.wait(.8):
+            with lock:
+                current=jobs.get(job.id,{})
+                return {k:current[k] for k in ('status','result','error') if k in current}
     return {'status': 'running'}

@@ -16,6 +16,18 @@ from PIL import Image
 
 
 class MediaTests(unittest.TestCase):
+    def test_fast_inspection_returns_receipt_without_waiting_for_callback(self):
+        import threading
+        release=threading.Event();started=threading.Event();finished=threading.Event()
+        def callback(job):
+            started.set();release.wait(2);finished.set()
+        try:
+            with patch.object(app,'post_info',return_value={}),patch.object(app,'metadata',return_value={'media_type':'text','caption':'Tweet'}),patch.object(app,'notify_completion',side_effect=callback):
+                response=self.client.post('/jobs',headers=self.headers,json={**self.job,'url':'https://x.com/test/status/123'})
+                self.assertEqual(response.json()['status'],'done')
+                self.assertTrue(started.wait(1));self.assertFalse(finished.is_set())
+                release.set();self.assertTrue(finished.wait(1))
+        finally:release.set()
     def test_native_youtube_metadata_and_download_use_bounded_subprocess(self):
         native={'info':{'id':'abcdefghijk','title':'Short','duration':65},'heights':[144,360,720],'has_audio':True}
         with tempfile.TemporaryDirectory() as directory,patch.object(app,'omega_post',side_effect=app.PublicYouTubeError('unavailable')),patch.object(app,'run',return_value=native) as command:
@@ -193,7 +205,7 @@ class MediaTests(unittest.TestCase):
           {'videoId':'covercover1','title':'Correct Artist — The Song cover','author':'Correct Artist','lengthSeconds':200},
           {'videoId':'goodgood001','title':'Correct Artist — The Song (Official Audio)','author':'Correct Artist','lengthSeconds':200}]
         response=httpx.Response(200,json=entries,request=httpx.Request('GET',app.FALLBACK_BASE))
-        with tempfile.TemporaryDirectory() as directory,patch.object(app.source_http,'get',return_value=response),patch.object(app,'post_info',return_value={'engine':'invidious'}) as selected:
+        with tempfile.TemporaryDirectory() as directory,patch.object(app,'run',return_value={'entries':entries}),patch.object(app,'post_info',return_value={'engine':'invidious','info':{'title':'Correct Artist — The Song','duration':200}}) as selected:
             result=app.spotify_recording(post,directory)
             self.assertEqual(selected.call_args.args[0],'https://www.youtube.com/watch?v=goodgood001')
             self.assertEqual(result['source_url'],'https://www.youtube.com/watch?v=goodgood001')
@@ -305,11 +317,63 @@ class MediaTests(unittest.TestCase):
         post={'entity':{'title':'Cheshme Man','artists':[{'name':'Dariush'}],'duration':297080}}
         entries={'entries':[{'title':'Cheshme Man','uploader':'Dariush','duration':297,'webpage_url':'https://soundcloud.com/dariush/protected'},
             {'title':'Cheshme Man','uploader':'Dariush','duration':30,'webpage_url':'https://soundcloud.com/dariush/preview'},
-            {'title':'Cheshme Man Dariush','uploader':'Public','duration':293,'webpage_url':'https://soundcloud.com/public/recording'}]}
-        with patch.object(app,'run',side_effect=[entries,app.MediaError('DRM protected'),{'title':'Cheshme Man Dariush','formats':[{}]}]) as run:
+            {'title':'Cheshme Man Dariush','uploader':'Public','duration':297,'webpage_url':'https://soundcloud.com/public/recording'}]}
+        with patch.object(app,'run',side_effect=[entries,app.MediaError('DRM protected'),{'title':'Cheshme Man Dariush','duration':297,'formats':[{}]}]) as run:
             selected=app.spotify_public_recording(post,'unused')
         self.assertEqual(selected['source_url'],'https://soundcloud.com/public/recording')
         self.assertEqual(run.call_count,3)
+
+    def test_spotify_goriz_rejects_slowed_slug_and_wrong_duration_before_extraction(self):
+        post={'entity':{'title':'Goriz','artists':[{'name':'Ebi'}],'duration':320066}}
+        entries={'entries':[
+            {'title':'Ebi - Goriz','uploader':'r.kh','duration':331.331,'webpage_url':'https://soundcloud.com/user-587823482/ebi-goriz-slowed-mp3'},
+            {'title':'Ebi - Goriz','uploader':'Other','duration':320,'webpage_url':'https://soundcloud.com/other/ebi-goriz-slowed-mp3'},
+            {'title':'Ebi - Goriz','uploader':'Ebi','duration':320.1,'webpage_url':'https://soundcloud.com/ebi/goriz'}]}
+        clean={'title':'Ebi - Goriz','duration':320.1,'formats':[{}]}
+        with patch.object(app,'run',side_effect=[entries,clean]) as command:
+            result=app.spotify_public_recording(post,'unused')
+        self.assertEqual(result['source_url'],'https://soundcloud.com/ebi/goriz')
+        self.assertEqual(command.call_count,2)
+        self.assertTrue(app.recording_duration_matches(320.1,320.066))
+        self.assertFalse(app.recording_duration_matches(331.331,320.066))
+
+    def test_spotify_rechecks_full_metadata_for_hidden_modified_versions(self):
+        post={'entity':{'title':'Goriz','artists':[{'name':'Ebi'}],'duration':320066}}
+        entries={'entries':[{'title':'Ebi - Goriz','duration':320,'webpage_url':'https://soundcloud.com/ebi/goriz'}]}
+        for info in [{'title':'Ebi - Goriz (Sped Up)','duration':320,'formats':[{}]},
+                     {'title':'Ebi - Goriz','track':'Goriz Remix','duration':320,'formats':[{}]},
+                     {'title':'Ebi - Goriz','duration':331.331,'formats':[{}]}]:
+            with self.subTest(info=info),patch.object(app,'run',side_effect=[entries,info]):
+                with self.assertRaises(app.MediaError):app.spotify_public_recording(post,'unused')
+
+    def test_spotify_prefers_verified_artist_youtube_without_invidious_wait(self):
+        post={'entity':{'title':'Goriz','artists':[{'name':'Ebi'}],'duration':320066}}
+        entries={'entries':[
+            {'id':'slowed00001','title':'Ebi - Goriz Slowed','channel':'Ebi','channel_is_verified':True,'duration':320},
+            {'id':'changed0001','title':'Ebi - Goriz','channel':'Ebi','channel_is_verified':True,'duration':331.331},
+            {'id':'Gg7WaROxggI','title':'Goriz','channel':'EBI','channel_is_verified':True,'duration':321}]}
+        resolved={'engine':'direct','info':{'title':'Goriz','duration':320.9}}
+        with patch.object(app,'run',return_value=entries) as command,patch.object(app,'public_audio_post',side_effect=app.PublicAudioUnavailable('cold')),patch.object(app.source_http,'get') as slow,patch.object(app,'post_info',return_value=resolved) as fetch:
+            result=app.spotify_recording(post,'unused',official_only=True)
+        slow.assert_not_called();self.assertEqual(command.call_args.kwargs['timeout'],12)
+        self.assertEqual(fetch.call_args.args[0],'https://www.youtube.com/watch?v=Gg7WaROxggI')
+        self.assertEqual(result['expected_duration'],320.066)
+
+    def test_spotify_ready_public_audio_skips_video_and_reuses_validated_source(self):
+        source={'engine':'public-audio','files':[('https://cdn.example.org/audio.m4a',{'extension':'m4a'})],'info':{'duration':320},'expected_duration':320.066}
+        post={'engine':'spotify','entity':{'title':'Goriz'}}
+        job=app.Request(**{**self.job,'kind':'download','mode':'mp3'})
+        with tempfile.TemporaryDirectory() as directory,patch.object(app,'spotify_recording',return_value=source) as select,patch.object(app,'fetch_file') as fetch,patch.object(app,'run',return_value={'format':{'duration':'320.074'}}),patch.object(app,'normalize_audio',return_value=Path(directory)/'out.mp3'),patch.object(app,'download') as video:
+            self.assertEqual(app.download_audio(post,job,directory)[0][0],'audio')
+            app.download_audio(post,job,directory)
+        self.assertEqual(select.call_count,1);self.assertEqual(fetch.call_count,2);video.assert_not_called()
+
+    def test_spotify_validates_actual_direct_source_duration_before_audio_conversion(self):
+        post={'engine':'direct','info':{'title':'Goriz'},'expected_duration':320.066}
+        job=app.Request(**{**self.job,'kind':'download','mode':'mp3'})
+        with patch.object(app,'download',return_value=[('video',Path('source.mp4'))]),patch.object(app,'run',return_value={'format':{'duration':'331.285'}}),patch.object(app,'normalize_audio') as convert:
+            with self.assertRaisesRegex(app.MediaError,'different version'):app.download_audio(post,job,'unused')
+        convert.assert_not_called()
 
 
     def test_direct_telegram_url_delivery_skips_upload_and_preserves_author_link(self):
