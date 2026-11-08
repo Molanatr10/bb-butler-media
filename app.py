@@ -26,6 +26,7 @@ from PIL import Image, ImageOps
 from pydantic import BaseModel, ConfigDict, Field
 from youtube_public import omega_post, PublicYouTubeError
 from youtube_audio_public import public_audio_post, PublicAudioUnavailable
+from youtube_audio_proxy import download_proxy_audio, ProxyAudioUnavailable
 
 DetectorFactory.seed = 0
 Image.MAX_IMAGE_PIXELS = 25_000_000
@@ -622,7 +623,8 @@ def normalize_audio(source, mode, directory, index):
     if not stream:raise MediaError('No audio stream was found in this post.')
     bitrate=min(192,max(64,int(stream.get('bit_rate') or 128000)//1000))
     output=Path(directory)/f'converted-audio-{index}.{ "mp3" if mode=="mp3" else "m4a" }'
-    codec=['-c:a','copy'] if mode!='mp3' and stream.get('codec_name')=='aac' else ['-c:a','libmp3lame' if mode=='mp3' else 'aac','-b:a',f'{bitrate}k']
+    compatible=stream.get('codec_name')==('mp3' if mode=='mp3' else 'aac')
+    codec=['-c:a','copy'] if compatible else ['-c:a','libmp3lame' if mode=='mp3' else 'aac','-b:a',f'{bitrate}k']
     run(['ffmpeg','-nostdin','-v','error','-y','-i',str(source),'-vn',*codec,'-threads','1','-fs',str(MAX_VIDEO+1),str(output)],directory,timeout=180)
     if output.stat().st_size>MAX_VIDEO:raise MediaError('This audio file is too large to send.')
     return output
@@ -737,24 +739,12 @@ def validate_native_duration(paths, post, native, directory):
                 raise MediaError('YouTube supplied an incomplete stream. The download was not sent.')
 
 
-def download_audio(post,job,directory):
-    spotify_input=None
-    if post['engine']=='spotify':
-        if job.mode=='preview':
-            url=(post.get('deezer') or {}).get('preview') or (post['entity'].get('audioPreview') or {}).get('url')
-            if not url:raise MediaError('Spotify does not provide a preview for this item.')
-            target=Path(directory)/'spotify-preview.mp3';fetch_file(url,target,MAX_IMAGE)
-            return [('audio',target)]
-        spotify_input=post;original=post
-        if post.get('deezer'):
-            original={**post,'entity':{**post['entity'],'title':post['deezer']['title'],'artists':[{'name':post['deezer']['artist']['name']}],'duration':post['deezer']['duration']*1000}}
-        with cache_lock:recording=spotify_input.get('recording')
-        if recording and recording[0]>time.time():post=dict(recording[1])
-        else:
-            try:post=spotify_recording(original,directory,official_only=True)
-            except (MediaError,httpx.HTTPError,ValueError):post=spotify_public_recording(original,directory)
-    paths=[]
-    if post['engine']=='public-audio':
+def acquire_audio(post,job,directory):
+    data=None;paths=[]
+    if post['engine']=='proxy-audio':
+        try:paths=[download_proxy_audio(post['source_url'],Path(directory)/'verified-source.mp3',source_http,job.mode)]
+        except ProxyAudioUnavailable:raise MediaError('The verified recording is temporarily unavailable from the free audio sources.') from None
+    elif post['engine']=='public-audio':
         target=Path(directory)/'source-audio.m4a'
         try:fetch_file(post['files'][0][0],target,MAX_VIDEO);paths=[target]
         except (MediaError,httpx.HTTPError):
@@ -779,6 +769,32 @@ def download_audio(post,job,directory):
     else:
         paths=[path for kind,path in download(post,job.model_copy(update={'mode':'video','url':post.get('source_url') or job.url}),directory) if kind=='video']
     if not paths:raise MediaError('No downloadable audio was found.')
+    return paths,post,data
+
+
+def download_audio(post,job,directory):
+    spotify_input=None
+    if post['engine']=='spotify':
+        if job.mode=='preview':
+            url=(post.get('deezer') or {}).get('preview') or (post['entity'].get('audioPreview') or {}).get('url')
+            if not url:raise MediaError('Spotify does not provide a preview for this item.')
+            target=Path(directory)/'spotify-preview.mp3';fetch_file(url,target,MAX_IMAGE)
+            return [('audio',target)]
+        spotify_input=post;original=post
+        if post.get('deezer'):
+            original={**post,'entity':{**post['entity'],'title':post['deezer']['title'],'artists':[{'name':post['deezer']['artist']['name']}],'duration':post['deezer']['duration']*1000}}
+        with cache_lock:recording=spotify_input.get('recording')
+        if recording and recording[0]>time.time():post=dict(recording[1])
+        else:
+            try:post=spotify_recording(original,directory,official_only=True)
+            except (MediaError,httpx.HTTPError,ValueError):post=spotify_public_recording(original,directory)
+    try:paths,post,data=acquire_audio(post,job,directory)
+    except (MediaError,httpx.HTTPError):
+        source=post.get('source_url')
+        if post['engine']=='proxy-audio' or spotify_input is None or not source or not youtube_id(source) or not post.get('expected_duration'):raise
+        try:target=download_proxy_audio(source,Path(directory)/'verified-source.mp3',source_http,job.mode)
+        except ProxyAudioUnavailable:raise MediaError('The verified recording is temporarily unavailable from the free audio sources.') from None
+        paths=[target];post={**post,'engine':'proxy-audio'};data=None
     if post.get('expected_duration'):
         for p in paths:
             probe=run(['ffprobe','-v','error','-show_entries','format=duration','-of','json',str(p)],directory,json_output=True)
@@ -991,7 +1007,7 @@ def execute(job):
 
 @app.get('/health')
 def health():
-    return {'ok': True, 'release': '2026-11-08-tweet-context'}
+    return {'ok': True, 'release': '2026-11-08-audio-fallback'}
 
 
 @app.post('/jobs')

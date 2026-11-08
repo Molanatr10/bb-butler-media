@@ -16,6 +16,32 @@ from PIL import Image
 
 
 class MediaTests(unittest.TestCase):
+    def test_spotify_blocked_source_uses_same_verified_recording_and_reuses_selection(self):
+        source={'engine':'direct','source_url':'https://www.youtube.com/watch?v=Gg7WaROxggI','expected_duration':320.066,'info':{'duration':320}}
+        original={'engine':'spotify','entity':{}};job=app.Request(**{**self.job,'kind':'verify','mode':'mp3'})
+        error=httpx.HTTPStatusError('blocked',request=httpx.Request('GET','https://cdn.example.org/'),response=httpx.Response(403))
+        with tempfile.TemporaryDirectory() as d,patch.object(app,'spotify_recording',return_value=source) as select,patch.object(app,'download',side_effect=error) as blocked,patch.object(app,'download_proxy_audio',return_value=Path(d)/'verified.mp3') as fallback,patch.object(app,'run',return_value={'format':{'duration':'320.074'}}),patch.object(app,'normalize_audio',return_value=Path(d)/'ready.mp3'):
+            self.assertEqual(app.download_audio(original,job,d)[0][0],'audio');app.download_audio(original,job,d)
+            self.assertEqual(select.call_count,1);self.assertEqual(blocked.call_count,1);self.assertEqual(fallback.call_count,2)
+            self.assertEqual(fallback.call_args.args[0],source['source_url'])
+
+    def test_spotify_proxy_wrong_duration_is_rejected_before_conversion(self):
+        source={'engine':'direct','source_url':'https://www.youtube.com/watch?v=Gg7WaROxggI','expected_duration':320.066,'info':{}}
+        original={'engine':'spotify','entity':{}};job=app.Request(**{**self.job,'kind':'verify','mode':'mp3'})
+        with patch.object(app,'spotify_recording',return_value=source),patch.object(app,'download',side_effect=app.MediaError('Blocked')),patch.object(app,'download_proxy_audio',return_value=Path('verified.mp3')),patch.object(app,'run',return_value={'format':{'duration':'331.285'}}),patch.object(app,'normalize_audio') as convert:
+            with self.assertRaisesRegex(app.MediaError,'different version'):app.download_audio(original,job,'unused')
+            convert.assert_not_called()
+
+    def test_compatible_mp3_is_copied_without_lossy_reencoding(self):
+        commands=[]
+        def command(args,*unused,**kwargs):
+            commands.append(args)
+            if args[0]=='ffprobe':return {'format':{'duration':'320.074'},'streams':[{'codec_type':'audio','codec_name':'mp3','bit_rate':'242000'}]}
+            Path(args[-1]).write_bytes(b'copied audio')
+        with tempfile.TemporaryDirectory() as d,patch.object(app,'run',side_effect=command):
+            app.normalize_audio(Path(d)/'source.mp3','mp3',d,0)
+        self.assertIn('copy',commands[-1]);self.assertNotIn('libmp3lame',commands[-1])
+
     def test_tweet_context_is_preserved_for_text_and_media_without_following_quote_chains(self):
         original={'id_str':'124','text':'Original text','lang':'fr','user':{'name':'Original','screen_name':'original'},'photos':[{'url':'https://pbs.twimg.com/media/parent.jpg'}],'quoted_tweet':{'id_str':'125','text':'Ancestor'}}
         tweet={'id_str':'123','text':'Main text','quoted_tweet':original}
