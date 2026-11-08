@@ -250,4 +250,15 @@ class MediaTests(unittest.TestCase):
         self.assertEqual(selected['source_url'],'https://soundcloud.com/public/recording')
         self.assertEqual(run.call_count,3)
 
+
+    def test_direct_telegram_url_delivery_skips_upload_and_preserves_author_link(self):
+        name='OGi';url='https://x.com/i/status/123'
+        job=app.Request(**{**self.job,'kind':'download','caption':name+'\n\nTweet text','caption_entities':[{'type':'text_link','offset':0,'length':3,'url':url}]})
+        with patch.object(app,'telegram',return_value={'message_id':8,'video':{'file_id':'delivered-file'}}) as api:
+            result=app.deliver([('video','https://cdn.example.org/video.mp4')],job,remote=True)
+        self.assertTrue(result['direct']);self.assertFalse(result['cached'])
+        self.assertEqual(api.call_args.args[1]['video'],'https://cdn.example.org/video.mp4')
+        self.assertEqual(api.call_args.args[2],{})
+        self.assertEqual(api.call_args.args[1]['caption_entities'][0]['url'],url)
+
 if __name__=='__main__':unittest.main()

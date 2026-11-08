@@ -46,6 +46,12 @@ class MediaError(Exception):
     pass
 
 
+class TelegramDeliveryError(MediaError):
+    def __init__(self,code):
+        super().__init__('Telegram could not deliver this media. Try a smaller file or lower resolution.')
+        self.code=code
+
+
 class Request(BaseModel):
     model_config = ConfigDict(extra='forbid')
     id: str = Field(pattern=r'^[a-f0-9]{32}$')
@@ -59,6 +65,7 @@ class Request(BaseModel):
     file_id: str | None = Field(default=None, max_length=512)
     caption: str = Field(default='', max_length=10000)
     language: str | None = Field(default=None, max_length=16)
+    caption_entities: list[dict] = Field(default_factory=list,max_length=10)
     mode: str = Field(default='video', pattern=r'^(video|images|audio|mp3|preview)$')
 
 
@@ -260,7 +267,8 @@ def twitter_public_post(url):
                 files.append((best['url'],{'extension':'mp4','variants':variants}))
     if len(files)>20:raise MediaError('Use a post with 20 or fewer media items.')
     if not files and not caption:raise MediaError('This tweet has no public text or media.')
-    return {'engine':'direct' if files else 'text','files':files,'heights':sorted(heights),'info':{'title':caption[:180] or 'Twitter post','description':caption},'original_only':not heights}
+    author=data.get('user') or {};name=str(author.get('name') or author.get('screen_name') or 'Twitter author')[:128]
+    return {'engine':'direct' if files else 'text','files':files,'heights':sorted(heights),'info':{'title':caption[:180] or 'Twitter post','description':caption},'source_author':{'name':name,'url':'https://x.com/i/status/'+identifier},'original_only':not heights}
 
 
 def instagram_embed_post(url):
@@ -277,6 +285,7 @@ def instagram_embed_post(url):
     nodes=[x.get('node',{}) for x in media.get('edge_sidecar_to_children',{}).get('edges',[])] or [media]
     files=[]
     for node in nodes:
+        if float(node.get('video_duration') or 0)>600:raise MediaError('This free downloader supports videos up to 10 minutes.')
         video=node.get('video_url');address=video or node.get('display_url')
         if address:files.append((public_url(address),{'extension':'mp4' if video else 'jpg'}))
     if not files or len(files)>20:raise MediaError('No supported Instagram media was found.')
@@ -284,15 +293,16 @@ def instagram_embed_post(url):
 
 
 def tiktok_public_post(url):
-    response=httpx.get('https://www.tikwm.com/api/',params={'url':url,'hd':'1'},timeout=12)
+    response=httpx.get('https://www.tikwm.com/api/',params={'url':url},timeout=12)
     response.raise_for_status()
     data=response.json()
     if data.get('code')!=0:raise MediaError('The public TikTok downloader could not retrieve this post.')
     data=data.get('data') or {};files=[]
+    if float(data.get('duration') or 0)>600:raise MediaError('This free downloader supports videos up to 10 minutes.')
     if data.get('images'):
         files=[(public_url(address),{'extension':'jpg'}) for address in data['images']]
     else:
-        address=data.get('hdplay') if data.get('hdplay') and int(data.get('hd_size') or 0)<=MAX_VIDEO else data.get('play')
+        address=data.get('play') or data.get('hdplay')
         if address:files=[(public_url(address),{'extension':'mp4'})]
     if not files or len(files)>20:raise MediaError('No supported TikTok media was found.')
     return {'engine':'direct','files':files,'info':{'title':data.get('title') or 'TikTok media','description':data.get('title') or ''},'original_only':True}
@@ -344,7 +354,7 @@ def metadata(post):
         language = 'fa' if re.search('[پچژگ]', caption) else detect(caption)
     except Exception:
         language = 'unknown'
-    if post['engine']=='text':return {'title':title,'caption':caption,'language':language,'media_type':'text','has_video':False,'has_audio':False,'heights':[],'audio_modes':[]}
+    if post['engine']=='text':return {'title':title,'caption':caption,'language':language,'media_type':'text','source_author':post.get('source_author'),'has_video':False,'has_audio':False,'heights':[],'audio_modes':[]}
     if post['engine'] == 'yt-dlp':
         entries = post['entries']
         all_formats=[f for e in entries for f in e.get('formats', [])]
@@ -364,7 +374,7 @@ def metadata(post):
         has_video = any(str(meta.get('extension') or '').lower() in ('mp4', 'webm', 'mov') for _, meta in post['files'])
         heights = post.get('heights',[] if post.get('original_only') else [360,480,720,1080] if has_video else [])
         has_audio=has_video
-    return {'caption': caption, 'title': title, 'language': language, 'has_video': has_video,'has_audio':has_audio,'media_type':'video' if has_video else 'audio' if has_audio else 'images', 'heights': heights,'original_only':bool(post.get('original_only')),'audio_modes':['audio','mp3'] if has_audio else []}
+    return {'caption': caption, 'title': title, 'language': language, 'has_video': has_video,'has_audio':has_audio,'media_type':'video' if has_video else 'audio' if has_audio else 'images', 'heights': heights,'original_only':bool(post.get('original_only')),'source_author':post.get('source_author'),'audio_modes':['audio','mp3'] if has_audio else []}
 
 
 def convert_sticker(source, output):
@@ -389,7 +399,7 @@ def telegram(method, body, files=None):
         response = client.post(url, data={k: json.dumps(v) if isinstance(v, (dict, list, bool)) else str(v) for k, v in body.items()}, files=files) if files else client.post(url, json=body)
         data = response.json()
     if not data.get('ok'):
-        raise MediaError('Telegram could not deliver this media. Try a smaller file or lower resolution.')
+        raise TelegramDeliveryError(data.get('error_code',response.status_code))
     return data['result']
 
 
@@ -582,23 +592,28 @@ def download(post, job, directory):
     return normalized
 
 
-def deliver(items, job, cached=False):
+def deliver(items, job, cached=False, remote=False):
     ids = [];receipts=[]
     caption = job.caption
+    def send(method,payload,files=None):
+        try:return telegram(method,payload,files)
+        except TelegramDeliveryError as error:
+            error.partial=bool(ids);raise
     for index, batch in enumerate(album_batches(items)):
         with contextlib.ExitStack() as stack:
             files, media = {}, []
             for i, (kind, path) in enumerate(batch):
                 key = f'file{i}'
-                if not cached:files[key] = (path.name, stack.enter_context(open(path, 'rb')), 'video/mp4' if kind == 'video' else ('audio/mpeg' if path.suffix=='.mp3' else 'audio/mp4') if kind=='audio' else 'image/jpeg')
-                item = {'type': kind, 'media': path if cached else f'attach://{key}'}
+                if not (cached or remote):files[key] = (path.name, stack.enter_context(open(path, 'rb')), 'video/mp4' if kind == 'video' else ('audio/mpeg' if path.suffix=='.mp3' else 'audio/mp4') if kind=='audio' else 'image/jpeg')
+                item = {'type': kind, 'media': path if cached or remote else f'attach://{key}'}
                 if i == 0 and index == 0 and len(caption) <= 1024:
                     item['caption'] = caption
+                    if job.caption_entities:item['caption_entities']=job.caption_entities
                 if kind == 'video':
                     item['supports_streaming'] = True
                 media.append(item)
             if len(batch) > 1:
-                sent = telegram('sendMediaGroup', {**base_body(job), 'media': media}, files)
+                sent = send('sendMediaGroup', {**base_body(job), 'media': media}, files)
                 ids.extend(m['message_id'] for m in sent)
                 for (kind,_),message in zip(batch,sent):
                     value=message.get(kind);value=value[-1] if isinstance(value,list) and value else value
@@ -606,20 +621,32 @@ def deliver(items, job, cached=False):
             else:
                 kind, _ = batch[0]
                 body = {**base_body(job), kind: media[0]['media'], 'caption': caption if index == 0 and len(caption) <= 1024 else ''}
+                if index==0 and len(caption)<=1024 and job.caption_entities:body['caption_entities']=job.caption_entities
                 if kind == 'video': body['supports_streaming'] = True
-                sent = telegram({'video':'sendVideo','audio':'sendAudio','photo':'sendPhoto'}[kind], body, files)
+                sent = send({'video':'sendVideo','audio':'sendAudio','photo':'sendPhoto'}[kind], body, files)
                 ids.append(sent['message_id'])
                 value=sent.get(kind);value=value[-1] if isinstance(value,list) and value else value
                 if isinstance(value,dict) and value.get('file_id'):receipts.append((kind,value['file_id']))
     if len(caption) > 1024:
         for offset in range(0, len(caption), 3900):
-            sent = telegram('sendMessage', {**base_body(job), 'text': caption[offset:offset + 3900], 'link_preview_options': {'is_disabled': True}})
+            sent = send('sendMessage', {**base_body(job), 'text': caption[offset:offset + 3900],**({'entities':job.caption_entities} if offset==0 and job.caption_entities else {}), 'link_preview_options': {'is_disabled': True}})
             ids.append(sent['message_id'])
     if job.kind=='download' and len(receipts)==len(items):
         with cache_lock:
             if len(file_cache)>=50:file_cache.pop(next(iter(file_cache)),None)
             file_cache[media_key(job)]=(time.time()+3600,receipts)
-    return {'message_ids': ids,'cached':cached}
+    return {'message_ids': ids,'cached':cached,'direct':remote}
+
+
+def direct_items(post,job):
+    if post.get('engine')!='direct' or job.mode not in ('video','images'):return None
+    items=[]
+    for address,meta in post.get('files') or []:
+        if meta.get('variants'):
+            choices=[v for v in meta['variants'] if v['height']<=(job.height or 1080)] or meta['variants']
+            address=max(choices,key=lambda v:(v['height'],v['bitrate']))['url']
+        items.append(('video' if meta.get('extension') in ('mp4','mov','webm') else 'photo',public_url(address)))
+    return items or None
 
 
 def media_key(job):
@@ -667,8 +694,14 @@ def execute(job):
                     files=download(post,job,directory)
                     result={'verification_only':True,'metadata':metadata(post),'files':[{'kind':kind,'bytes':p.stat().st_size,'sha256':hashlib.sha256(p.read_bytes()).hexdigest()} for kind,p in files]}
                 else:
-                    files=download(post,job,directory);timings['download_ms']=round((time.monotonic()-began)*1000)-timings['lookup_ms']
-                    sent_at=time.monotonic();result=deliver(files,job);timings['send_ms']=round((time.monotonic()-sent_at)*1000)
+                    result=None;remote=direct_items(post,job)
+                    if remote:
+                        try:result=deliver(remote,job,remote=True)
+                        except TelegramDeliveryError as error:
+                            if error.code!=400 or getattr(error,'partial',False):raise
+                    if result is None:
+                        files=download(post,job,directory);timings['download_ms']=round((time.monotonic()-began)*1000)-timings['lookup_ms']
+                        sent_at=time.monotonic();result=deliver(files,job);timings['send_ms']=round((time.monotonic()-sent_at)*1000)
         result['timings_ms']={**timings,'total_ms':round((time.monotonic()-began)*1000)}
         with lock:
             jobs[job.id].update(status='done', result=result)
