@@ -905,7 +905,7 @@ def execute(job):
 
 @app.get('/health')
 def health():
-    return {'ok': True}
+    return {'ok': True, 'release': '2026-11-08-youtube-cache'}
 
 
 @app.post('/jobs')
