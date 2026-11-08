@@ -101,6 +101,12 @@ class MediaTests(unittest.TestCase):
         for url in ['http://youtube.com/watch?v=abcdef','https://localhost/','https://youtube.com.evil.test/watch?v=abcdef','https://x.com/user','https://youtube.com/playlist?list=abc','https://x.com:443/a/status/123']:
             self.assertEqual(self.client.post('/jobs',headers=self.headers,json={**self.job,'url':url}).status_code,422)
 
+    def test_bellona_backend_access_is_explicit_and_still_authenticated(self):
+        job={**self.job,'chat_id':-1002568879931}
+        self.assertEqual(self.client.post('/jobs',json=job).status_code,401)
+        with patch.object(app.youtube_pool,'submit'):
+            self.assertEqual(self.client.post('/jobs',headers=self.headers,json=job).status_code,200)
+
     def test_submission_is_idempotent_and_rejects_changed_payload(self):
         with patch.object(app.youtube_pool,'submit') as submit:
             for _ in range(2):
@@ -274,6 +280,20 @@ class MediaTests(unittest.TestCase):
         self.assertEqual(app.metadata(post)['caption'],'Original caption')
         self.assertTrue(app.metadata(post)['original_only'])
 
+    def test_instagram_simple_single_photo_avoids_slow_extractors(self):
+        flags={'isRichEmbed':False,'isSidecar':False,'isGuideEmbed':False,'isProfileEmbed':False,'contextJSON':None}
+        body='<img src="https://cdn.example.org/avatar.jpg"><a class="EmbeddedMedia" href="https://www.instagram.com/p/AbCd123/?ig=embed"><img class="EmbeddedMediaImage" src="https://cdn.example.org/photo.jpg?x=1&amp;y=2"></a><div class="Caption"><a class="CaptionUsername">author</a>Actual &amp; caption<br>second line</div>'
+        def response(config,content=body):
+            return httpx.Response(200,text='"PolarisEmbedSimple","init",[],['+json.dumps(config,separators=(',',':'))+']'+content,request=httpx.Request('GET','https://www.instagram.com/'))
+        with patch.object(app.source_http,'get',return_value=response(flags)),patch.object(app,'public_url',side_effect=lambda u:u),patch.object(app,'run',side_effect=AssertionError('No subprocess should run')):
+            with tempfile.TemporaryDirectory() as d:post=app._extract_post_info('https://www.instagram.com/p/AbCd123/',d)
+            self.assertEqual(post['files'],[('https://cdn.example.org/photo.jpg?x=1&y=2',{'extension':'jpg'})])
+            self.assertEqual(app.metadata(post)['caption'],'Actual & caption\nsecond line')
+            self.assertEqual(app.metadata(post)['media_type'],'images')
+        for config,content in [({**flags,'isRichEmbed':True},body),({**flags,'isSidecar':True},body),(flags,body.replace('/p/AbCd123/','/p/Other/')),(flags,body+body)]:
+            with self.subTest(config=config),patch.object(app.source_http,'get',return_value=response(config,content)):
+                with self.assertRaises(app.MediaError):app.instagram_embed_post('https://www.instagram.com/p/AbCd123/')
+
     def test_tiktok_share_forms_and_provider_photos(self):
         for url in ['https://www.tiktok.com/t/ZPLqxkx7d/','https://m.tiktok.com/v/123.html']:
             self.assertEqual(app.validate_source(url),url)
@@ -367,6 +387,14 @@ class MediaTests(unittest.TestCase):
             self.assertEqual(app.download_audio(post,job,directory)[0][0],'audio')
             app.download_audio(post,job,directory)
         self.assertEqual(select.call_count,1);self.assertEqual(fetch.call_count,2);video.assert_not_called()
+
+    def test_public_audio_cloud_failure_keeps_verified_source_and_checks_actual_duration(self):
+        post={'engine':'public-audio','files':[('https://cdn.example.org/audio.m4a',{})],'source_url':'https://youtube.com/watch?v=Gg7WaROxggI','expected_duration':320.066}
+        job=app.Request(**{**self.job,'kind':'verify','mode':'mp3'})
+        replacement={'engine':'direct','info':{'title':'Goriz','duration':320}}
+        with tempfile.TemporaryDirectory() as directory,patch.object(app,'fetch_file',side_effect=httpx.ConnectError('offline')),patch.object(app,'post_info',return_value=replacement) as resolve,patch.object(app,'download',return_value=[('video',Path('fallback.mp4'))]) as video,patch.object(app,'run',return_value={'format':{'duration':'331.285'}}),patch.object(app,'normalize_audio') as convert:
+            with self.assertRaisesRegex(app.MediaError,'different version'):app.download_audio(post,job,directory)
+        self.assertEqual(resolve.call_args.args[0],post['source_url']);self.assertEqual(video.call_args.args[1].url,post['source_url']);convert.assert_not_called()
 
     def test_spotify_validates_actual_direct_source_duration_before_audio_conversion(self):
         post={'engine':'direct','info':{'title':'Goriz'},'expected_duration':320.066}

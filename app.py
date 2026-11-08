@@ -14,6 +14,7 @@ import sys
 import tempfile
 import threading
 import time
+from html.parser import HTMLParser
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse, parse_qs, urlencode
 from difflib import SequenceMatcher
@@ -31,6 +32,7 @@ Image.MAX_IMAGE_PIXELS = 25_000_000
 MAX_VIDEO = 45 * 1024 * 1024
 MAX_IMAGE = 10 * 1024 * 1024
 ALLOWED_CHAT = int(os.environ.get('ALLOWED_CHAT_ID', '0'))
+ADDITIONAL_ALLOWED_CHATS = {-1002568879931}  # Bellona GP, enabled by the owner.
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 pool = ThreadPoolExecutor(max_workers=2)
 transcode_gate = threading.Semaphore(1)
@@ -306,13 +308,52 @@ def twitter_public_post(url):
     return {'engine':'direct' if files else 'text','files':files,'heights':sorted(heights),'info':{'title':caption[:180] or 'Twitter post','description':caption},'source_author':{'name':name,'username':str(author.get('screen_name') or ''),'url':'https://x.com/i/status/'+identifier+'?mx=2'},'original_only':not heights}
 
 
+class InstagramSimplePhoto(HTMLParser):
+    """Read only the post image, never avatars, recommendations or video covers."""
+    def __init__(self,shortcode):
+        super().__init__(convert_charrefs=True)
+        self.shortcode=shortcode;self.stack=[];self.images=[];self.caption=[]
+
+    def handle_starttag(self,tag,attrs):
+        attrs=dict(attrs);classes=set(attrs.get('class','').split())
+        if tag=='img' and 'EmbeddedMediaImage' in classes:
+            for parent,values in reversed(self.stack):
+                if parent=='a' and 'EmbeddedMedia' in values.get('class','').split():
+                    link=urlparse(values.get('href',''))
+                    if link.scheme=='https' and link.hostname in ('www.instagram.com','instagram.com') and link.path.rstrip('/') in ('/p/'+self.shortcode,'/reel/'+self.shortcode):
+                        self.images.append(attrs.get('src',''))
+                    break
+        if tag=='br' and any('Caption' in a.get('class','').split() for _,a in self.stack):self.caption.append('\n')
+        if tag not in ('area','base','br','col','embed','hr','img','input','link','meta','param','source','track','wbr'):
+            self.stack.append((tag,attrs))
+
+    def handle_endtag(self,tag):
+        for i in range(len(self.stack)-1,-1,-1):
+            if self.stack[i][0]==tag:
+                del self.stack[i:];break
+
+    def handle_data(self,data):
+        if any('Caption' in a.get('class','').split() for _,a in self.stack) and not any('CaptionUsername' in a.get('class','').split() for _,a in self.stack):self.caption.append(data)
+
+
 def instagram_embed_post(url):
     shortcode=urlparse(url).path.strip('/').split('/')[-1]
     response=source_http.get(f'https://www.instagram.com/p/{shortcode}/embed/captioned/',headers={'User-Agent':'Mozilla/5.0'},timeout=12)
     response.raise_for_status()
     if len(response.content)>4*1024*1024:raise MediaError('Instagram returned too much metadata.')
     match=re.search(r'"contextJSON"\s*:\s*("(?:\\.|[^"\\])*")',response.text)
-    if not match:raise MediaError('Instagram did not expose public embed media.')
+    if not match:
+        # Instagram serves some single photos as HTML with contextJSON:null.
+        # Explicit simple/non-sidecar flags prevent returning a video cover or
+        # silently truncating an album to its first photo.
+        flags=re.search(r'"PolarisEmbedSimple","init",\[\],\[({[^{}]+})\]',response.text)
+        config=json.loads(flags.group(1)) if flags else {}
+        if config.get('contextJSON','missing') is None and config.get('isRichEmbed') is False and config.get('isSidecar') is False and config.get('isProfileEmbed') is False and config.get('isGuideEmbed') is False:
+            photo=InstagramSimplePhoto(shortcode);photo.feed(response.text)
+            if len(photo.images)==1:
+                caption=''.join(photo.caption).strip()
+                return {'engine':'direct','files':[(public_url(photo.images[0]),{'extension':'jpg'})],'info':{'title':caption[:180] or 'Instagram photo','description':caption},'original_only':True}
+        raise MediaError('Instagram did not expose public embed media.')
     context=json.loads(json.loads(match.group(1)))
     media=context.get('gql_data',{}).get('shortcode_media',{})
     if media.get('shortcode')!=shortcode or context.get('context',{}).get('copyright_blocked'):raise MediaError('This Instagram post is not publicly downloadable.')
@@ -622,7 +663,15 @@ def download_audio(post,job,directory):
             except (MediaError,httpx.HTTPError,ValueError):post=spotify_public_recording(original,directory)
     paths=[]
     if post['engine']=='public-audio':
-        target=Path(directory)/'source-audio.m4a';fetch_file(post['files'][0][0],target,MAX_VIDEO);paths=[target]
+        target=Path(directory)/'source-audio.m4a'
+        try:fetch_file(post['files'][0][0],target,MAX_VIDEO);paths=[target]
+        except (MediaError,httpx.HTTPError):
+            # A ready audio URL can still be unavailable from this cloud IP.
+            # Keep the verified video identity and duration; do not rematch.
+            replacement=dict(post_info(post['source_url'],directory))
+            replacement.update(source_url=post['source_url'],expected_duration=post['expected_duration'])
+            post=replacement
+            paths=[p for kind,p in download(post,job.model_copy(update={'mode':'video','url':post['source_url']}),directory) if kind=='video']
     elif post['engine']=='youtube-native':
         data=youtube_native(post.get('source_url') or job.url,directory,job.mode)
         paths=[Path(directory)/data['files'][0]]
@@ -823,6 +872,7 @@ def execute(job):
         message = str(error) if isinstance(error, MediaError) else 'Media processing failed. Try again later or choose a smaller file.'
         with lock:
             jobs[job.id].update(status='error', error=message)
+            if job.kind=='verify':jobs[job.id]['result']={'verification_only':True,'error_type':type(error).__name__}
     finally:
         ready=jobs.get(job.id,{}).get('ready')
         if ready:ready.set()
@@ -839,7 +889,7 @@ def submit(job: Request, authorization: str = Header(default='')):
     secret = os.environ.get('MEDIA_BACKEND_SECRET', '')
     if len(secret) < 32 or not hmac.compare_digest(authorization, f'Bearer {secret}'):
         raise HTTPException(401, 'Unauthorized')
-    if job.chat_id != ALLOWED_CHAT and not (job.chat_id>0 and job.user_id==job.chat_id):
+    if job.chat_id not in {ALLOWED_CHAT,*ADDITIONAL_ALLOWED_CHATS} and not (job.chat_id>0 and job.user_id==job.chat_id):
         raise HTTPException(403, 'Group not allowed')
     if job.kind != 'sticker':
         try: validate_source(job.url)
