@@ -13,3 +13,8 @@ Link inspection distinguishes images, videos and audio. Images are delivered aut
 Authenticated `verify` jobs download and validate media without sending Telegram messages. They return file sizes and hashes, then delete the temporary files, enabling cloud checks without posting samples.
 
 Test with `python -m unittest -v`. Dependency versions are pinned in `requirements.txt`; update yt-dlp/gallery-dl when source sites change.
+
+
+Latency improvements: metadata runs in a separate bounded executor; inspected source information is cached for ten minutes and reused at download time. Successfully sent public media can reuse Telegram file IDs for one hour, avoiding another download/upload. Receipts are bounded and ephemeral. Authenticated completion callbacks notify the Cloudflare Worker directly; scheduled polling remains recovery. No login cookies are imported.
+
+Public source helpers: Twitter syndication provides text-only posts, images and video variants; Instagram captioned embeds provide anonymously exposed media; TikWM provides a free fallback for TikTok. These helpers receive only the requested public post URL/ID, never Telegram credentials or member IDs. Spotify full audio matches an openly playable public recording on SoundCloud or YouTube and checks artist/title/duration; protected recordings and preview-only matches are rejected. YouTube availability remains dependent on anonymous origin/fallback access.

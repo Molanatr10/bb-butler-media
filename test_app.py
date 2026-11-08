@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 os.environ['MEDIA_BACKEND_SECRET']='test-secret-that-is-longer-than-32-characters'
 os.environ['ALLOWED_CHAT_ID']='-123'
+os.environ['MEDIA_CALLBACK_URL']=''
 import app
 from fastapi.testclient import TestClient
 from PIL import Image
@@ -17,7 +18,7 @@ from PIL import Image
 class MediaTests(unittest.TestCase):
     def setUp(self):
         self.client=TestClient(app.app)
-        app.jobs.clear()
+        app.jobs.clear();app.post_cache.clear();app.file_cache.clear()
         self.headers={'Authorization':'Bearer '+os.environ['MEDIA_BACKEND_SECRET']}
         self.job={'id':'a'*32,'kind':'inspect','chat_id':-123,'message_id':12,'url':'https://www.youtube.com/watch?v=abcdefghijk'}
 
@@ -28,7 +29,7 @@ class MediaTests(unittest.TestCase):
             self.assertEqual(self.client.post('/jobs',headers=self.headers,json={**self.job,'url':url}).status_code,422)
 
     def test_submission_is_idempotent_and_rejects_changed_payload(self):
-        with patch.object(app.pool,'submit') as submit:
+        with patch.object(app.inspect_pool,'submit') as submit:
             for _ in range(2):
                 self.assertEqual(self.client.post('/jobs',headers=self.headers,json=self.job).json(),{'status':'running'})
             self.assertEqual(submit.call_count,1)
@@ -37,7 +38,7 @@ class MediaTests(unittest.TestCase):
         self.assertEqual(self.client.post('/jobs',headers=self.headers,json=self.job).json()['result'],{'heights':[360]})
 
     def test_private_jobs_require_matching_telegram_user(self):
-        with patch.object(app.pool,'submit'):
+        with patch.object(app.inspect_pool,'submit'):
             private={**self.job,'chat_id':123,'user_id':123}
             self.assertEqual(self.client.post('/jobs',headers=self.headers,json=private).status_code,200)
             self.assertEqual(self.client.post('/jobs',headers=self.headers,json={**private,'id':'c'*32,'user_id':999}).status_code,403)
@@ -76,7 +77,7 @@ class MediaTests(unittest.TestCase):
 
     def test_gallery_fallback_uses_correct_cli_and_detects_photos(self):
         raw=[[2,{}],[3,'https://cdn.example.org/a.jpg',{'extension':'jpg','description':'این یک پیام فارسی است'}]]
-        with tempfile.TemporaryDirectory() as directory,patch.object(app,'run',side_effect=[app.MediaError('not a video'),raw]) as run:
+        with tempfile.TemporaryDirectory() as directory,patch.object(app,'instagram_embed_post',side_effect=app.MediaError('unavailable')),patch.object(app,'run',side_effect=[app.MediaError('not a video'),raw]) as run:
             post=app.post_info('https://www.instagram.com/p/AbCd123/',directory)
             self.assertIn('--config-ignore',run.call_args.args[0])
             result=app.metadata(post)
@@ -163,5 +164,88 @@ class MediaTests(unittest.TestCase):
                 app.execute(job)
         self.assertEqual(app.jobs[job.id]['status'],'done');self.assertTrue(app.jobs[job.id]['result']['verification_only'])
 
+
+
+    def test_metadata_cache_single_flight_and_expiry(self):
+        import concurrent.futures,time
+        url='https://x.com/user/status/123'
+        def extract(*args):time.sleep(.03);return {'engine':'test'}
+        with patch.object(app,'_extract_post_info',side_effect=extract) as get:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=3) as workers:
+                results=list(workers.map(lambda _:app.post_info(url,'unused'),range(3)))
+            self.assertEqual(get.call_count,1)
+            self.assertEqual(results,[{'engine':'test'}]*3)
+            app.post_cache[url]=(0,{'engine':'stale'})
+            self.assertEqual(app.post_info(url,'unused'),{'engine':'test'})
+            self.assertEqual(get.call_count,2)
+
+    def test_inspection_is_not_blocked_by_download_worker(self):
+        import threading
+        release=threading.Event();inspected=threading.Event()
+        blocked=app.pool.submit(release.wait)
+        try:
+            with patch.object(app,'execute',side_effect=lambda job:inspected.set()):
+                self.assertEqual(self.client.post('/jobs',headers=self.headers,json=self.job).status_code,200)
+                self.assertTrue(inspected.wait(1),'inspection waited behind download')
+        finally:release.set();blocked.result(timeout=2)
+
+    def test_instagram_captioned_embed_and_original_video(self):
+        context={'context':{'copyright_blocked':False},'gql_data':{'shortcode_media':{'shortcode':'AbCd123','video_url':'https://cdn.example.org/movie.mp4','edge_media_to_caption':{'edges':[{'node':{'text':'Original caption'}}]}}}}
+        html='"contextJSON":'+json.dumps(json.dumps(context))
+        response=httpx.Response(200,text=html,request=httpx.Request('GET','https://www.instagram.com/'))
+        with patch.object(app.httpx,'get',return_value=response),patch.object(app,'public_url',side_effect=lambda u:u):
+            post=app.instagram_embed_post('https://www.instagram.com/reel/AbCd123/')
+        self.assertEqual(post['files'][0][0],'https://cdn.example.org/movie.mp4')
+        self.assertEqual(app.metadata(post)['caption'],'Original caption')
+        self.assertTrue(app.metadata(post)['original_only'])
+
+    def test_tiktok_share_forms_and_provider_photos(self):
+        for url in ['https://www.tiktok.com/t/ZPLqxkx7d/','https://m.tiktok.com/v/123.html']:
+            self.assertEqual(app.validate_source(url),url)
+        response=httpx.Response(200,json={'code':0,'data':{'title':'Photo post','images':['https://cdn.example.org/a.jpg','https://cdn.example.org/b.jpg']}},request=httpx.Request('GET','https://www.tikwm.com/api/'))
+        with patch.object(app.httpx,'get',return_value=response),patch.object(app,'public_url',side_effect=lambda u:u):
+            self.assertEqual(len(app.tiktok_public_post('https://www.tiktok.com/t/ZPLqxkx7d/')['files']),2)
+
+    def test_telegram_file_cache_resends_without_upload_and_uses_new_reply(self):
+        job=app.Request(**{**self.job,'kind':'download','caption':'First'})
+        with tempfile.TemporaryDirectory() as d:
+            f=Path(d)/'video.mp4';f.write_bytes(b'video')
+            with patch.object(app,'telegram',return_value={'message_id':7,'video':{'file_id':'cached-telegram-file'}}):app.deliver([('video',f)],job)
+            receipt=app.file_cache[app.media_key(job)][1]
+            second=job.model_copy(update={'message_id':99,'caption':'Second'})
+            with patch.object(app,'telegram',return_value={'message_id':8,'video':{'file_id':'cached-telegram-file'}}) as send:
+                result=app.deliver(receipt,second,cached=True)
+            self.assertTrue(result['cached']);self.assertEqual(send.call_args.args[1]['video'],'cached-telegram-file')
+            self.assertEqual(send.call_args.args[1]['caption'],'Second')
+            self.assertEqual(send.call_args.args[1]['reply_parameters']['message_id'],99)
+            self.assertEqual(send.call_args.args[2],{})
+
+
+    def test_twitter_text_only_and_photo_syndication(self):
+        tweet={'id_str':'123','text':'A text-only tweet'}
+        def response():return httpx.Response(200,json=tweet,request=httpx.Request('GET','https://cdn.syndication.twimg.com/'))
+        with patch.object(app.httpx,'get',side_effect=lambda *a,**k:response()),patch.object(app,'public_url',side_effect=lambda u:u):
+            post=app.twitter_public_post('https://x.com/user/status/123')
+            self.assertEqual(app.metadata(post)['media_type'],'text')
+            tweet['mediaDetails']=[{'type':'photo','media_url_https':'https://pbs.twimg.com/media/photo.jpg'}]
+            post=app.twitter_public_post('https://x.com/user/status/123')
+            self.assertEqual(app.metadata(post)['media_type'],'images')
+            self.assertEqual(post['files'][0][0],'https://pbs.twimg.com/media/photo.jpg')
+
+    def test_native_download_reuses_inspected_info(self):
+        with tempfile.TemporaryDirectory() as d:
+            args=app.native_input({'engine':'yt-dlp','info':{'title':'Inspected','formats':[]}},'https://x.com/user/status/123',d)
+            self.assertEqual(args[0],'--load-info-json')
+            self.assertEqual(json.loads(Path(args[1]).read_text())['title'],'Inspected')
+
+    def test_spotify_fallback_skips_protected_recordings_and_requires_matching_duration(self):
+        post={'entity':{'title':'Cheshme Man','artists':[{'name':'Dariush'}],'duration':297080}}
+        entries={'entries':[{'title':'Cheshme Man','uploader':'Dariush','duration':297,'webpage_url':'https://soundcloud.com/dariush/protected'},
+            {'title':'Cheshme Man','uploader':'Dariush','duration':30,'webpage_url':'https://soundcloud.com/dariush/preview'},
+            {'title':'Cheshme Man Dariush','uploader':'Public','duration':293,'webpage_url':'https://soundcloud.com/public/recording'}]}
+        with patch.object(app,'run',side_effect=[entries,app.MediaError('DRM protected'),{'title':'Cheshme Man Dariush','formats':[{}]}]) as run:
+            selected=app.spotify_public_recording(post,'unused')
+        self.assertEqual(selected['source_url'],'https://soundcloud.com/public/recording')
+        self.assertEqual(run.call_count,3)
 
 if __name__=='__main__':unittest.main()
