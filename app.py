@@ -71,7 +71,7 @@ class Request(BaseModel):
     url: str | None = Field(default=None, max_length=2048)
     height: int | None = Field(default=None, ge=144, le=1080)
     file_id: str | None = Field(default=None, max_length=512)
-    caption: str = Field(default='', max_length=10000)
+    caption: str = Field(default='', max_length=16000)
     language: str | None = Field(default=None, max_length=16)
     caption_entities: list[dict] = Field(default_factory=list,max_length=10)
     mode: str = Field(default='video', pattern=r'^(video|images|audio|mp3|preview)$')
@@ -287,13 +287,36 @@ def post_info(url, directory):
         return post
 
 
-def twitter_public_post(url):
+def twitter_json(identifier,timeout=10):
     from yt_dlp.jsinterp import js_number_to_string
-    identifier=urlparse(url).path.rstrip('/').split('/')[-1]
     token=js_number_to_string((int(identifier)/1e15)*math.pi,36).translate(str.maketrans(dict.fromkeys('0.')))
-    response=source_http.get('https://cdn.syndication.twimg.com/tweet-result',params={'id':identifier,'lang':'en','token':token},timeout=10)
+    response=source_http.get('https://cdn.syndication.twimg.com/tweet-result',params={'id':identifier,'lang':'en','token':token},timeout=timeout)
     response.raise_for_status();data=response.json()
     if data.get('id_str')!=identifier:raise MediaError('Twitter did not return this public post.')
+    return data
+
+
+def twitter_context(data,identifier):
+    node=data.get('parent') or {}
+    if not isinstance(node,dict):node={}
+    parent=data.get('in_reply_to_status_id_str')
+    if not node and isinstance(parent,str) and re.fullmatch(r'\d{1,25}',parent) and parent!=identifier:
+        try:node=twitter_json(parent,timeout=2)
+        except (MediaError,httpx.HTTPError,ValueError,TypeError):pass
+    if not node:node=data.get('quoted_tweet') or {}
+    if not isinstance(node,dict):return None
+    target=node.get('id_str')
+    if not isinstance(target,str) or not re.fullmatch(r'\d{1,25}',target) or target==identifier:return None
+    user=node.get('user') or {};caption=str(node.get('text') or '')[:6000]
+    has_media=bool(node.get('video') or node.get('video_info') or node.get('mediaDetails') or node.get('photos'))
+    if not caption.strip() and not has_media:return None
+    return {'caption':caption,'language':str(node.get('lang') or 'unknown'),'has_media':has_media,'url':'https://x.com/i/status/'+target,
+        'source_author':{'name':str(user.get('name') or user.get('screen_name') or 'Twitter author')[:128],'username':str(user.get('screen_name') or ''),'url':'https://x.com/i/status/'+target+'?mx=2'}}
+
+
+def twitter_public_post(url):
+    identifier=urlparse(url).path.rstrip('/').split('/')[-1]
+    data=twitter_json(identifier)
     caption=str(data.get('text') or '');files=[];heights=set()
     for media in data.get('mediaDetails') or []:
         if media.get('type')=='photo':
@@ -329,7 +352,7 @@ def twitter_public_post(url):
             else:break
         else:
             if total>0:sizes[height]={'bytes':round(total),'estimated':estimated}
-    return {'engine':'direct' if files else 'text','files':files,'heights':sorted(heights),'video_sizes':sizes,'info':{'title':caption[:180] or 'Twitter post','description':caption},'source_author':{'name':name,'username':str(author.get('screen_name') or ''),'url':'https://x.com/i/status/'+identifier+'?mx=2'},'original_only':not heights}
+    return {'engine':'direct' if files else 'text','files':files,'heights':sorted(heights),'video_sizes':sizes,'info':{'title':caption[:180] or 'Twitter post','description':caption},'context_tweet':twitter_context(data,identifier),'source_author':{'name':name,'username':str(author.get('screen_name') or ''),'url':'https://x.com/i/status/'+identifier+'?mx=2'},'original_only':not heights}
 
 
 class InstagramSimplePhoto(HTMLParser):
@@ -506,7 +529,7 @@ def metadata(post):
         language = 'fa' if re.search('[پچژگ]', caption) else detect(caption)
     except Exception:
         language = 'unknown'
-    if post['engine']=='text':return {'title':title,'caption':caption,'language':language,'media_type':'text','source_author':post.get('source_author'),'has_video':False,'has_audio':False,'heights':[],'audio_modes':[]}
+    if post['engine']=='text':return {'title':title,'caption':caption,'language':language,'media_type':'text','source_author':post.get('source_author'),'context_tweet':post.get('context_tweet'),'has_video':False,'has_audio':False,'heights':[],'audio_modes':[]}
     if post['engine'] == 'yt-dlp':
         entries = post['entries']
         all_formats=[f for e in entries for f in e.get('formats', [])]
@@ -528,7 +551,7 @@ def metadata(post):
         has_video = any(str(meta.get('extension') or '').lower() in ('mp4', 'webm', 'mov') for _, meta in post['files'])
         heights = post.get('heights',[] if post.get('original_only') else [360,480,720,1080] if has_video else [])
         has_audio=has_video
-    return {'caption': caption, 'title': title, 'language': language, 'has_video': has_video,'has_audio':has_audio,'media_type':'video' if has_video else 'audio' if has_audio else 'images', 'heights': heights,'video_sizes':video_format_sizes(post,heights),'original_only':bool(post.get('original_only')),'source_author':post.get('source_author'),'audio_modes':['audio','mp3'] if has_audio else []}
+    return {'caption': caption, 'title': title, 'language': language, 'has_video': has_video,'has_audio':has_audio,'media_type':'video' if has_video else 'audio' if has_audio else 'images', 'heights': heights,'video_sizes':video_format_sizes(post,heights),'original_only':bool(post.get('original_only')),'source_author':post.get('source_author'),'context_tweet':post.get('context_tweet'),'audio_modes':['audio','mp3'] if has_audio else []}
 
 
 def convert_sticker(source, output):
@@ -822,6 +845,17 @@ def download(post, job, directory):
     return normalized
 
 
+def caption_chunks(text):
+    parts=[];units=0;start=0
+    for char in text:
+        width=2 if ord(char)>0xffff else 1
+        if units+width>3900:
+            yield ''.join(parts),start
+            start+=units;parts=[];units=0
+        parts.append(char);units+=width
+    if parts:yield ''.join(parts),start
+
+
 def deliver(items, job, cached=False, remote=False):
     ids = [];receipts=[]
     caption = job.caption
@@ -858,8 +892,14 @@ def deliver(items, job, cached=False, remote=False):
                 value=sent.get(kind);value=value[-1] if isinstance(value,list) and value else value
                 if isinstance(value,dict) and value.get('file_id'):receipts.append((kind,value['file_id']))
     if len(caption) > 1024:
-        for offset in range(0, len(caption), 3900):
-            sent = send('sendMessage', {**base_body(job), 'text': caption[offset:offset + 3900],**({'entities':job.caption_entities} if offset==0 and job.caption_entities else {}), 'link_preview_options': {'is_disabled': True}})
+        for chunk,start in caption_chunks(caption):
+            # Telegram entity offsets use UTF-16, including supplementary names.
+            end=start+len(chunk.encode('utf-16-le'))//2
+            entities=[]
+            for entity in job.caption_entities:
+                lo=max(start,entity['offset']);hi=min(end,entity['offset']+entity['length'])
+                if hi>lo:entities.append({**entity,'offset':lo-start,'length':hi-lo})
+            sent = send('sendMessage', {**base_body(job), 'text': chunk,**({'entities':entities} if entities else {}), 'link_preview_options': {'is_disabled': True}})
             ids.append(sent['message_id'])
     if job.kind=='download' and len(receipts)==len(items):
         with cache_lock:
@@ -951,7 +991,7 @@ def execute(job):
 
 @app.get('/health')
 def health():
-    return {'ok': True, 'release': '2026-11-08-media-latency'}
+    return {'ok': True, 'release': '2026-11-08-tweet-context'}
 
 
 @app.post('/jobs')

@@ -16,6 +16,34 @@ from PIL import Image
 
 
 class MediaTests(unittest.TestCase):
+    def test_tweet_context_is_preserved_for_text_and_media_without_following_quote_chains(self):
+        original={'id_str':'124','text':'Original text','lang':'fr','user':{'name':'Original','screen_name':'original'},'photos':[{'url':'https://pbs.twimg.com/media/parent.jpg'}],'quoted_tweet':{'id_str':'125','text':'Ancestor'}}
+        tweet={'id_str':'123','text':'Main text','quoted_tweet':original}
+        with patch.object(app,'twitter_json',return_value=tweet) as get:
+            post=app.twitter_public_post('https://x.com/reply/status/123');result=app.metadata(post)
+            self.assertEqual(get.call_count,1);self.assertEqual(result['context_tweet']['caption'],'Original text')
+            self.assertTrue(result['context_tweet']['has_media']);self.assertNotIn('context_tweet',result['context_tweet'])
+        with patch.object(app,'twitter_json',side_effect=[{'id_str':'123','text':'Main text','in_reply_to_status_id_str':'124'},original]) as get:
+            post=app.twitter_public_post('https://x.com/reply/status/123');self.assertEqual(get.call_count,2)
+            self.assertEqual(post['context_tweet']['url'],'https://x.com/i/status/124')
+        self.assertIsNone(app.twitter_context({'quoted_tweet':'malformed'},'123'))
+
+    def test_original_parent_failure_does_not_fail_the_main_tweet(self):
+        with patch.object(app,'twitter_json',side_effect=[{'id_str':'123','text':'Main text','in_reply_to_status_id_str':'124'},httpx.ConnectError('Unavailable')]):
+            post=app.twitter_public_post('https://x.com/reply/status/123')
+            self.assertEqual(post['info']['description'],'Main text');self.assertIsNone(post['context_tweet'])
+
+    def test_long_original_tweet_captions_keep_utf16_links_in_the_correct_chunk(self):
+        text='😀'*2100+'\nOriginal name\nOriginal text'
+        job=app.Request(**{**self.job,'kind':'download','caption':text,'caption_entities':[{'type':'text_link','offset':4201,'length':13,'url':'https://x.com/i/status/124'}]})
+        calls=[]
+        def send(method,body,files=None):calls.append((method,body));return {'message_id':len(calls),'photo':[{'file_id':'photo-ref'}]}
+        with patch.object(app,'telegram',side_effect=send):app.deliver([('photo','photo-ref')],job,cached=True)
+        messages=[body for method,body in calls if method=='sendMessage']
+        self.assertEqual(''.join(m['text'] for m in messages),text)
+        self.assertEqual(messages[1]['entities'][0]['offset'],301)
+        self.assertTrue(all(len(m['text'].encode('utf-16-le'))//2<=3900 for m in messages))
+
     def test_cached_youtube_inspection_returns_receipt_in_the_initial_request(self):
         import threading,time
         release=threading.Event();started=threading.Event();finished=threading.Event()
