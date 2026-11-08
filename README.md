@@ -8,4 +8,8 @@ The Cloudflare bot queues image conversion and public-post downloads, presents r
 
 Limits: 10 MB input images, 45 MB per video, 10-minute videos, 20 media items per post, one active processing thread, five queued/running tasks. Multi-image posts use Telegram albums of up to ten items without leaving a lone final image. Private, login-only, restricted or source-blocked posts may fail; no browser cookies are collected automatically.
 
+Link inspection distinguishes images, videos and audio. Images are delivered automatically; video/audio use requester-only download buttons in the Cloudflare bot. Spotify supports clearly labeled previews and matching public recordings, rather than extracting protected Spotify audio. The configured YouTube fallback receives the requested public video ID; it receives no Telegram user or chat IDs. `YOUTUBE_FALLBACK_URL` can override the default public Invidious instance or disable it with an empty value. Public fallbacks can be unavailable or rate-limited.
+
+Authenticated `verify` jobs download and validate media without sending Telegram messages. They return file sizes and hashes, then delete the temporary files, enabling cloud checks without posting samples.
+
 Test with `python -m unittest -v`. Dependency versions are pinned in `requirements.txt`; update yt-dlp/gallery-dl when source sites change.

@@ -14,7 +14,8 @@ import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, urlencode
+from difflib import SequenceMatcher
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException
@@ -31,6 +32,8 @@ app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 pool = ThreadPoolExecutor(max_workers=1)
 lock = threading.Lock()
 jobs = {}
+post_cache = {}
+FALLBACK_BASE = os.environ.get('YOUTUBE_FALLBACK_URL', 'https://yt.chocolatemoo53.com').rstrip('/')
 
 
 class MediaError(Exception):
@@ -40,7 +43,7 @@ class MediaError(Exception):
 class Request(BaseModel):
     model_config = ConfigDict(extra='forbid')
     id: str = Field(pattern=r'^[a-f0-9]{32}$')
-    kind: str = Field(pattern=r'^(inspect|download|sticker)$')
+    kind: str = Field(pattern=r'^(inspect|download|sticker|verify)$')
     chat_id: int
     user_id: int | None = None
     message_id: int = Field(gt=0)
@@ -50,6 +53,7 @@ class Request(BaseModel):
     file_id: str | None = Field(default=None, max_length=512)
     caption: str = Field(default='', max_length=10000)
     language: str | None = Field(default=None, max_length=16)
+    mode: str = Field(default='video', pattern=r'^(video|images|audio|mp3|preview)$')
 
 
 def validate_source(url):
@@ -64,9 +68,11 @@ def validate_source(url):
         'instagram.com': r'/(p|reel|reels|tv)/[\w-]+/?',
         'x.com': r'/[^/]+/status/\d+/?', 'twitter.com': r'/[^/]+/status/\d+/?',
         'mobile.twitter.com': r'/[^/]+/status/\d+/?',
+        'open.spotify.com':r'/(?:intl-[a-z]{2}/)?(?:track|episode|album|playlist|show)/[A-Za-z0-9]{22}/?',
+        'spotify.link':r'/[A-Za-z0-9]+/?',
     }
     if u.scheme != 'https' or u.username or u.password or u.port or not re.fullmatch(paths.get(host, r'(?!)'), u.path):
-        raise MediaError('Use a public TikTok, YouTube, X/Twitter or Instagram post link.')
+        raise MediaError('Use a Spotify, YouTube, TikTok, X/Twitter or Instagram post link.')
     if host.endswith('youtube.com') and u.path == '/watch' and not re.fullmatch(r'[\w-]{6,}', parse_qs(u.query).get('v', [''])[0]):
         raise MediaError('Use a single YouTube video link.')
     return url
@@ -132,8 +138,78 @@ def ytdlp_args():
     return [sys.executable, '-m', 'yt_dlp', '--ignore-config', '--no-playlist', '--force-ipv4', '--socket-timeout', '15', '--retries', '1', '--extractor-retries', '1', '--js-runtimes', 'node']
 
 
+def youtube_id(url):
+    u=urlparse(url);host=(u.hostname or '').removeprefix('www.')
+    if host=='youtu.be':return u.path.strip('/')
+    if host in ('youtube.com','m.youtube.com'):
+        return parse_qs(u.query).get('v',[''])[0] if u.path=='/watch' else u.path.rstrip('/').rsplit('/',1)[-1]
+    return None
+
+
+def format_height(f):
+    match=re.search(r'(\d+)p',str(f.get('qualityLabel') or f.get('resolution') or ''))
+    if match:return int(match.group(1))
+    match=re.search(r'\d+x(\d+)',str(f.get('size') or ''))
+    return int(match.group(1)) if match else 0
+
+
+def fallback_post(url):
+    video=youtube_id(url)
+    if not FALLBACK_BASE or not re.fullmatch(r'[\w-]{11}',video or ''):raise MediaError('No free YouTube fallback is available.')
+    public_url(FALLBACK_BASE)
+    response=httpx.get(f'{FALLBACK_BASE}/api/v1/videos/{video}',params={'local':'true'},headers={'User-Agent':'Mozilla/5.0','Referer':FALLBACK_BASE+'/'},timeout=20)
+    if not response.is_success:raise MediaError('The free YouTube fallback is temporarily unavailable or rate-limited.')
+    data=response.json()
+    if data.get('videoId')!=video or data.get('error'):raise MediaError('The free YouTube fallback could not retrieve this video.')
+    formats=[*data.get('adaptiveFormats',[]),*data.get('formatStreams',[])]
+    if not any(f.get('url') for f in formats):raise MediaError('No downloadable formats were found for this video.')
+    if int(data.get('lengthSeconds') or 0)>600:raise MediaError('This free downloader supports videos up to 10 minutes.')
+    return {'engine':'invidious','video_id':video,'info':{'title':data.get('title'),'description':data.get('description'),'duration':data.get('lengthSeconds')},'formats':formats}
+
+
+def fallback_stream_url(post,format):
+    # Metadata can contain expired signed CDN URLs. Resolve a fresh original
+    # stream through the provider at download time instead of replaying them.
+    itag=str(format.get('itag') or '')
+    if not itag.isdecimal():raise MediaError('The selected stream could not be identified.')
+    return FALLBACK_BASE+'/latest_version?'+urlencode({'id':post['video_id'],'itag':itag,'local':'true'})
+
+
+def spotify_post(url):
+    if urlparse(url).hostname=='spotify.link':
+        with httpx.Client(follow_redirects=False,timeout=15) as client:
+            for _ in range(5):
+                public_url(url);response=client.get(url)
+                if not response.is_redirect:break
+                from urllib.parse import urljoin
+                url=urljoin(url,response.headers.get('location',''))
+                if (urlparse(url).hostname or '').endswith('spotify.com'):break
+    validate_source(url)
+    parts=urlparse(url).path.strip('/').split('/');kind,identifier=parts[-2:]
+    if kind not in ('track','episode'):raise MediaError('Please send an individual Spotify track or podcast episode rather than a playlist or album.')
+    response=httpx.get(f'https://open.spotify.com/embed/{kind}/{identifier}',timeout=20,follow_redirects=True)
+    response.raise_for_status()
+    match=re.search(r'<script[^>]*id="__NEXT_DATA__"[^>]*>(.*?)</script>',response.text,re.S)
+    if not match:raise MediaError('Spotify metadata is temporarily unavailable.')
+    entity=json.loads(match.group(1)).get('props',{}).get('pageProps',{}).get('state',{}).get('data',{}).get('entity',{})
+    if not entity.get('title'):raise MediaError('Spotify could not identify this item.')
+    title=str(entity['title']);artist=', '.join(a.get('name','') for a in (entity.get('artists') or []))
+    return {'engine':'spotify','info':{'title':f'{artist} — {title}' if artist else title,'description':f'{artist} — {title}' if artist else title},'entity':entity,'url':url}
+
+
 def post_info(url, directory):
     validate_source(url)
+    for key in list(post_cache):
+        if post_cache[key][0]<=time.time():del post_cache[key]
+    if len(post_cache)>=20:del post_cache[next(iter(post_cache))]
+    cached=post_cache.get(url)
+    if cached and cached[0]>time.time():return cached[1]
+    host=urlparse(url).hostname or ''
+    if 'spotify' in host:return spotify_post(url)
+    if youtube_id(url) and FALLBACK_BASE:
+        try:
+            post=fallback_post(url);post_cache[url]=(time.time()+600,post);return post
+        except (MediaError,httpx.HTTPError,ValueError):pass
     try:
         info = run(ytdlp_args() + ['--dump-single-json', '--skip-download', '--', url], directory, json_output=True)
         entries = info.get('entries') or [info]
@@ -166,15 +242,24 @@ def metadata(post):
         language = 'unknown'
     if post['engine'] == 'yt-dlp':
         entries = post['entries']
-        formats = [f for e in entries for f in e.get('formats', []) if f.get('vcodec') != 'none']
+        all_formats=[f for e in entries for f in e.get('formats', [])]
+        formats = [f for f in all_formats if f.get('vcodec') not in ('none',None)]
         heights = sorted({int(f['height']) for f in formats if f.get('height') and 144 <= f['height'] <= 1080})
-        if not heights:
+        has_video = bool(formats) or any(e.get('height') for e in entries)
+        has_audio = any(f.get('acodec') not in ('none',None) for f in all_formats)
+        if not heights and has_video:
             heights = [min(1080, int(entries[0].get('height') or 720))]
-        has_video = True
+    elif post['engine']=='invidious':
+        heights=sorted({format_height(f) for f in post['formats'] if str(f.get('type','')).startswith('video/') and 144<=format_height(f)<=1080})
+        has_video=bool(heights);has_audio=any(str(f.get('type','')).startswith('audio/') for f in post['formats'])
+    elif post['engine']=='spotify':
+        return {'title':title,'caption':caption,'language':language,'media_type':'audio','has_video':False,'has_audio':True,'heights':[],
+          'audio_modes':(['preview'] if (post['entity'].get('audioPreview') or {}).get('url') else [])+['audio','mp3'],'spotify_match':True}
     else:
         has_video = any(str(meta.get('extension') or '').lower() in ('mp4', 'webm', 'mov') for _, meta in post['files'])
         heights = [360, 480, 720, 1080] if has_video else []
-    return {'caption': caption, 'title': title, 'language': language, 'has_video': has_video, 'heights': heights}
+        has_audio=has_video
+    return {'caption': caption, 'title': title, 'language': language, 'has_video': has_video,'has_audio':has_audio,'media_type':'video' if has_video else 'audio' if has_audio else 'images', 'heights': heights,'audio_modes':['audio','mp3'] if has_audio else []}
 
 
 def convert_sticker(source, output):
@@ -238,9 +323,94 @@ def normalize_video(source, height, directory, index):
     return output
 
 
+def normalize_audio(source, mode, directory, index):
+    probe=run(['ffprobe','-v','error','-show_entries','format=duration:stream=codec_type,codec_name,bit_rate','-of','json',str(source)],directory,json_output=True)
+    if float(probe.get('format',{}).get('duration',601))>600:raise MediaError('This free downloader supports audio up to 10 minutes.')
+    stream=next((s for s in probe.get('streams',[]) if s.get('codec_type')=='audio'),None)
+    if not stream:raise MediaError('No audio stream was found in this post.')
+    bitrate=min(192,max(64,int(stream.get('bit_rate') or 128000)//1000))
+    output=Path(directory)/f'converted-audio-{index}.{ "mp3" if mode=="mp3" else "m4a" }'
+    codec=['-c:a','copy'] if mode!='mp3' and stream.get('codec_name')=='aac' else ['-c:a','libmp3lame' if mode=='mp3' else 'aac','-b:a',f'{bitrate}k']
+    run(['ffmpeg','-nostdin','-v','error','-y','-i',str(source),'-vn',*codec,'-threads','1','-fs',str(MAX_VIDEO+1),str(output)],directory,timeout=180)
+    if output.stat().st_size>MAX_VIDEO:raise MediaError('This audio file is too large to send.')
+    return output
+
+
+def spotify_recording(post,directory):
+    entity=post['entity'];title=str(entity.get('title') or '');artists=' '.join(a.get('name','') for a in (entity.get('artists') or []))
+    query=f'{artists} {title} official audio'.strip();entries=[]
+    if FALLBACK_BASE:
+        try:
+            response=httpx.get(FALLBACK_BASE+'/api/v1/search',params={'q':query,'type':'video'},headers={'User-Agent':'Mozilla/5.0','Referer':FALLBACK_BASE+'/'},timeout=20)
+            if response.is_success:entries=response.json()[:10]
+        except (httpx.HTTPError,ValueError):pass
+    if not entries:
+        data=run(ytdlp_args()+['--flat-playlist','--dump-single-json','--',f'ytsearch5:{query}'],directory,json_output=True)
+        entries=data.get('entries',[])
+    normalize=lambda text:' '.join(re.findall(r'\w+',str(text).casefold()))
+    expected_duration=float(entity.get('duration') or 0)/1000
+    ranked=[]
+    for entry in entries:
+        candidate=str(entry.get('title') or '');by=str(entry.get('author') or entry.get('channel') or '')
+        duration=float(entry.get('lengthSeconds') or entry.get('duration') or 0)
+        if duration>600 or expected_duration and duration and abs(duration-expected_duration)>max(15,expected_duration*.12):continue
+        primary=normalize(next(iter(entity.get('artists') or []),{}).get('name',''))
+        artist_match=not primary or primary in normalize(candidate+' '+by)
+        if not artist_match:continue
+        title_match=normalize(title) in normalize(candidate)
+        score=.8 if title_match else .8*SequenceMatcher(None,normalize(title),normalize(candidate)).ratio()
+        if primary:score+=.2
+        if any(word in candidate.lower() and word not in title.lower() for word in ['cover','remix','live','karaoke','sped up','slowed']):score-=.4
+        identifier=entry.get('videoId') or entry.get('id')
+        if re.fullmatch(r'[\w-]{11}',identifier or ''):ranked.append((score,identifier))
+    if not ranked or max(ranked)[0]<.65:raise MediaError('No confident public recording match was found for this Spotify track. Try its preview or send a direct video link.')
+    url='https://www.youtube.com/watch?v='+max(ranked)[1]
+    recording=dict(post_info(url,directory));recording['source_url']=url
+    return recording
+
+
+def download_audio(post,job,directory):
+    if post['engine']=='spotify':
+        if job.mode=='preview':
+            url=(post['entity'].get('audioPreview') or {}).get('url')
+            if not url:raise MediaError('Spotify does not provide a preview for this item.')
+            target=Path(directory)/'spotify-preview.mp3';fetch_file(url,target,MAX_IMAGE)
+            return [('audio',target)]
+        post=spotify_recording(post,directory)
+    paths=[]
+    if post['engine']=='invidious':
+        choices=[f for f in post['formats'] if str(f.get('type','')).startswith('audio/') and f.get('url')]
+        if not choices:raise MediaError('No audio stream was found for this video.')
+        selected=max(choices,key=lambda f:(str(f.get('type','')).startswith('audio/mp4'),int(f.get('bitrate') or 0)))
+        target=Path(directory)/('source-audio.m4a' if 'mp4' in selected['type'] else 'source-audio.webm')
+        fetch_file(fallback_stream_url(post,selected),target,MAX_VIDEO,{'Referer':FALLBACK_BASE+'/','User-Agent':'Mozilla/5.0'});paths=[target]
+    elif post['engine']=='yt-dlp':
+        run(ytdlp_args()+['--max-filesize','45M','-f','ba/b','-o',str(Path(directory)/'source-audio-%(autonumber)03d.%(ext)s'),'--',post.get('source_url') or job.url],directory,timeout=180)
+        paths=sorted(p for p in Path(directory).glob('source-audio-*') if p.suffix in ('.m4a','.mp3','.webm','.mp4','.ogg','.opus'))
+    else:
+        return [('audio',normalize_audio(path,job.mode,directory,i)) for i,(kind,path) in enumerate(download(post,job.model_copy(update={'mode':'video'}),directory)) if kind=='video']
+    if not paths:raise MediaError('No downloadable audio was found.')
+    return [('audio',normalize_audio(p,job.mode,directory,i)) for i,p in enumerate(paths)]
+
+
 def download(post, job, directory):
+    if job.mode in ('audio','mp3','preview'):return download_audio(post,job,directory)
     paths = []
-    if post['engine'] == 'yt-dlp':
+    if post['engine']=='invidious':
+        choices=[f for f in post['formats'] if str(f.get('type','')).startswith('video/') and f.get('url') and 0<format_height(f)<=(job.height or 720)]
+        if not choices:raise MediaError('That video resolution is not available. Send the link again to refresh the options.')
+        selected=max(choices,key=lambda f:(format_height(f),'mp4' in f.get('type',''),int(f.get('bitrate') or 0)))
+        video=Path(directory)/'source-video.bin';headers={'Referer':FALLBACK_BASE+'/','User-Agent':'Mozilla/5.0'}
+        fetch_file(fallback_stream_url(post,selected),video,MAX_VIDEO,headers)
+        audio_choices=[f for f in post['formats'] if str(f.get('type','')).startswith('audio/') and f.get('url')]
+        merged=Path(directory)/'video-merged.mkv'
+        if audio_choices:
+            audio=max(audio_choices,key=lambda f:('mp4' in f.get('type',''),int(f.get('bitrate') or 0)))
+            sound=Path(directory)/'source-audio.bin';fetch_file(fallback_stream_url(post,audio),sound,MAX_VIDEO,headers)
+            run(['ffmpeg','-nostdin','-v','error','-y','-i',str(video),'-i',str(sound),'-map','0:v:0','-map','1:a:0','-c','copy',str(merged)],directory,timeout=60)
+            paths=[merged]
+        else:paths=[video]
+    elif post['engine'] == 'yt-dlp':
         height = job.height or 720
         fmt = f'bv*[height<={height}][ext=mp4]+ba[ext=m4a]/b[height<={height}][ext=mp4]/bv*[height<={height}]+ba/b[height<={height}]'
         run(ytdlp_args() + ['--max-filesize', '45M', '-f', fmt, '--merge-output-format', 'mp4', '-o', str(Path(directory) / 'video-%(autonumber)03d.%(ext)s'), '--', job.url], directory, timeout=240)
@@ -257,7 +427,7 @@ def download(post, job, directory):
         raise MediaError('The requested resolution could not be downloaded. Try another resolution.')
     normalized = []
     for i, p in enumerate(paths):
-        if p.suffix in ('.mp4', '.webm', '.mkv', '.mov'):
+        if p.suffix in ('.mp4', '.webm', '.mkv', '.mov','.bin'):
             normalized.append(('video', normalize_video(p, job.height, directory, i)))
         else:
             target = Path(directory) / f'photo-{i}.jpg'
@@ -275,7 +445,7 @@ def deliver(items, job):
             files, media = {}, []
             for i, (kind, path) in enumerate(batch):
                 key = f'file{i}'
-                files[key] = (path.name, stack.enter_context(open(path, 'rb')), 'video/mp4' if kind == 'video' else 'image/jpeg')
+                files[key] = (path.name, stack.enter_context(open(path, 'rb')), 'video/mp4' if kind == 'video' else ('audio/mpeg' if path.suffix=='.mp3' else 'audio/mp4') if kind=='audio' else 'image/jpeg')
                 item = {'type': kind, 'media': f'attach://{key}'}
                 if i == 0 and index == 0 and len(caption) <= 1024:
                     item['caption'] = caption
@@ -289,7 +459,7 @@ def deliver(items, job):
                 kind, _ = batch[0]
                 body = {**base_body(job), kind: 'attach://file0', 'caption': caption if index == 0 and len(caption) <= 1024 else ''}
                 if kind == 'video': body['supports_streaming'] = True
-                sent = telegram('sendVideo' if kind == 'video' else 'sendPhoto', body, files)
+                sent = telegram({'video':'sendVideo','audio':'sendAudio','photo':'sendPhoto'}[kind], body, files)
                 ids.append(sent['message_id'])
     if len(caption) > 1024:
         for offset in range(0, len(caption), 3900):
@@ -314,7 +484,11 @@ def execute(job):
                 result = {'message_id': sent['message_id']}
             else:
                 post = post_info(job.url, directory)
-                result = metadata(post) if job.kind == 'inspect' else deliver(download(post, job, directory), job)
+                if job.kind=='inspect':result=metadata(post)
+                elif job.kind=='verify':
+                    files=download(post,job,directory)
+                    result={'verification_only':True,'metadata':metadata(post),'files':[{'kind':kind,'bytes':p.stat().st_size,'sha256':hashlib.sha256(p.read_bytes()).hexdigest()} for kind,p in files]}
+                else:result=deliver(download(post, job, directory), job)
         with lock:
             jobs[job.id].update(status='done', result=result)
     except Exception as error:
