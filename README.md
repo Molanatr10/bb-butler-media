@@ -24,3 +24,5 @@ For eligible public video/image posts, delivery first asks Telegram to fetch the
 
 
 Spotify matching also consults Deezer’s public catalog, requiring matching artist/title and a close duration before accepting a catalog record. Deezer previews are labeled as short clips; catalog metadata does not provide full-track audio or access to @DeezerMusicBot’s private library. No Deezer account credentials or DRM-unlocking code are used.
+
+YouTube also tries anonymous WEB/SABR extraction using pinned pytubefix 11.2.1 in a bounded subprocess, with video/audio merging and existing size/duration limits. It uses no user cookies or OAuth. YouTube inspections have their own queue; social direct deliveries and cached resends have a separate pool so long YouTube tasks do not occupy their workers. Metadata and Telegram requests reuse TLS connections. Cloud source acceptance remains dependent on YouTube; local success alone is not a cloud-delivery guarantee.

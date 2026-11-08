@@ -16,6 +16,41 @@ from PIL import Image
 
 
 class MediaTests(unittest.TestCase):
+    def test_native_youtube_metadata_and_download_use_bounded_subprocess(self):
+        native={'info':{'id':'abcdefghijk','title':'Short','duration':65},'heights':[144,360,720],'has_audio':True}
+        with tempfile.TemporaryDirectory() as directory,patch.object(app,'run',return_value=native) as command:
+            post=app._extract_post_info(self.job['url'],directory)
+            self.assertEqual(post['engine'],'youtube-native')
+            self.assertEqual(app.metadata(post)['heights'],[144,360,720])
+            self.assertEqual(command.call_args.kwargs['timeout'],35)
+            self.assertIn('youtube_native.py',command.call_args.args[0][1])
+            app.youtube_native(self.job['url'],directory,'video',360)
+            self.assertEqual(command.call_args.args[0][-3:],['abcdefghijk','video','360'])
+            self.assertEqual(command.call_args.kwargs['timeout'],150)
+
+    def test_native_youtube_stream_selection_respects_resolution_and_codec(self):
+        from types import SimpleNamespace
+        from youtube_native import choose_video,choose_audio
+        def stream(h,codec='avc1',audio=False):
+            return SimpleNamespace(resolution=f'{h}p' if h else None,includes_video_track=bool(h),includes_audio_track=audio,video_codec=codec,subtype='mp4',bitrate=128000,is_default_audio_track=audio)
+        low=stream(360);expensive=stream(360,'av01');large=stream(1080);audio=stream(0,audio=True)
+        self.assertIs(choose_video([large,expensive,low],360),low)
+        self.assertIs(choose_audio([low,audio]),audio)
+        with self.assertRaises(ValueError):choose_video([large],360)
+
+    def test_native_youtube_merges_audio_and_normalizes_output(self):
+        post={'engine':'youtube-native'}
+        job=app.Request(**{**self.job,'kind':'download','height':360})
+        with tempfile.TemporaryDirectory() as directory,patch.object(app,'youtube_native',return_value={'files':['native-0.mp4','native-1.m4a']}),patch.object(app,'run') as command,patch.object(app,'normalize_video',return_value=Path(directory)/'output.mp4'):
+            self.assertEqual(app.download(post,job,directory)[0][0],'video')
+            self.assertIn('copy',command.call_args.args[0])
+
+    def test_social_delivery_does_not_wait_for_youtube_download_pool(self):
+        job={**self.job,'kind':'download','url':'https://x.com/AdiiiFCB/status/2119524707880030446'}
+        with patch.object(app.delivery_pool,'submit') as fast,patch.object(app.pool,'submit') as slow:
+            self.assertEqual(self.client.post('/jobs',headers=self.headers,json=job).status_code,200)
+            self.assertEqual(fast.call_count,1);slow.assert_not_called()
+
     def setUp(self):
         self.client=TestClient(app.app)
         app.jobs.clear();app.post_cache.clear();app.file_cache.clear()
@@ -29,7 +64,7 @@ class MediaTests(unittest.TestCase):
             self.assertEqual(self.client.post('/jobs',headers=self.headers,json={**self.job,'url':url}).status_code,422)
 
     def test_submission_is_idempotent_and_rejects_changed_payload(self):
-        with patch.object(app.inspect_pool,'submit') as submit:
+        with patch.object(app.youtube_pool,'submit') as submit:
             for _ in range(2):
                 self.assertEqual(self.client.post('/jobs',headers=self.headers,json=self.job).json(),{'status':'running'})
             self.assertEqual(submit.call_count,1)
@@ -38,7 +73,7 @@ class MediaTests(unittest.TestCase):
         self.assertEqual(self.client.post('/jobs',headers=self.headers,json=self.job).json()['result'],{'heights':[360]})
 
     def test_private_jobs_require_matching_telegram_user(self):
-        with patch.object(app.inspect_pool,'submit'):
+        with patch.object(app.youtube_pool,'submit'):
             private={**self.job,'chat_id':123,'user_id':123}
             self.assertEqual(self.client.post('/jobs',headers=self.headers,json=private).status_code,200)
             self.assertEqual(self.client.post('/jobs',headers=self.headers,json={**private,'id':'c'*32,'user_id':999}).status_code,403)
@@ -98,7 +133,7 @@ class MediaTests(unittest.TestCase):
     def test_spotify_preview_is_labelled_and_full_audio_is_a_public_recording_match(self):
         state={'props':{'pageProps':{'state':{'data':{'entity':{'title':'Track','artists':[{'name':'Artist'}],'duration':200000,'audioPreview':{'url':'https://p.scdn.co/preview.mp3'}}}}}}}
         response=httpx.Response(200,text='<script id="__NEXT_DATA__" type="application/json">'+json.dumps(state)+'</script>',request=httpx.Request('GET','https://open.spotify.com'))
-        with patch.object(app.httpx,'get',return_value=response):post=app.spotify_post('https://open.spotify.com/track/11dFghVXANMlKmJXsNCbNl')
+        with patch.object(app.source_http,'get',return_value=response):post=app.spotify_post('https://open.spotify.com/track/11dFghVXANMlKmJXsNCbNl')
         result=app.metadata(post)
         self.assertEqual(result['title'],'Artist — Track');self.assertTrue(result['spotify_match']);self.assertIn('preview',result['audio_modes'])
         job=app.Request(**{**self.job,'kind':'download','mode':'preview'})
@@ -109,7 +144,7 @@ class MediaTests(unittest.TestCase):
     def test_fallback_resolutions_are_actual_formats_and_wrong_video_is_rejected(self):
         data={'videoId':'jNQXAC9IVRw','title':'Test','lengthSeconds':19,'adaptiveFormats':[{'type':'video/mp4','qualityLabel':'240p','url':'https://yt.chocolatemoo53.com/videoplayback'},{'type':'audio/mp4','bitrate':'128000','url':'https://yt.chocolatemoo53.com/videoplayback'}]}
         response=httpx.Response(200,json=data,request=httpx.Request('GET',app.FALLBACK_BASE))
-        with patch.object(app,'public_url'),patch.object(app.httpx,'get',return_value=response):
+        with patch.object(app,'public_url'),patch.object(app.source_http,'get',return_value=response):
             post=app.fallback_post('https://www.youtube.com/watch?v=jNQXAC9IVRw');result=app.metadata(post)
             self.assertEqual(result['heights'],[240]);self.assertTrue(result['has_audio'])
             with self.assertRaises(app.MediaError):app.fallback_post('https://www.youtube.com/watch?v=abcdefghijk')
@@ -132,7 +167,7 @@ class MediaTests(unittest.TestCase):
           {'videoId':'covercover1','title':'Correct Artist — The Song cover','author':'Correct Artist','lengthSeconds':200},
           {'videoId':'goodgood001','title':'Correct Artist — The Song (Official Audio)','author':'Correct Artist','lengthSeconds':200}]
         response=httpx.Response(200,json=entries,request=httpx.Request('GET',app.FALLBACK_BASE))
-        with tempfile.TemporaryDirectory() as directory,patch.object(app.httpx,'get',return_value=response),patch.object(app,'post_info',return_value={'engine':'invidious'}) as selected:
+        with tempfile.TemporaryDirectory() as directory,patch.object(app.source_http,'get',return_value=response),patch.object(app,'post_info',return_value={'engine':'invidious'}) as selected:
             result=app.spotify_recording(post,directory)
             self.assertEqual(selected.call_args.args[0],'https://www.youtube.com/watch?v=goodgood001')
             self.assertEqual(result['source_url'],'https://www.youtube.com/watch?v=goodgood001')
@@ -195,7 +230,7 @@ class MediaTests(unittest.TestCase):
         context={'context':{'copyright_blocked':False},'gql_data':{'shortcode_media':{'shortcode':'AbCd123','video_url':'https://cdn.example.org/movie.mp4','edge_media_to_caption':{'edges':[{'node':{'text':'Original caption'}}]}}}}
         html='"contextJSON":'+json.dumps(json.dumps(context))
         response=httpx.Response(200,text=html,request=httpx.Request('GET','https://www.instagram.com/'))
-        with patch.object(app.httpx,'get',return_value=response),patch.object(app,'public_url',side_effect=lambda u:u):
+        with patch.object(app.source_http,'get',return_value=response),patch.object(app,'public_url',side_effect=lambda u:u):
             post=app.instagram_embed_post('https://www.instagram.com/reel/AbCd123/')
         self.assertEqual(post['files'][0][0],'https://cdn.example.org/movie.mp4')
         self.assertEqual(app.metadata(post)['caption'],'Original caption')
@@ -205,7 +240,7 @@ class MediaTests(unittest.TestCase):
         for url in ['https://www.tiktok.com/t/ZPLqxkx7d/','https://m.tiktok.com/v/123.html']:
             self.assertEqual(app.validate_source(url),url)
         response=httpx.Response(200,json={'code':0,'data':{'title':'Photo post','images':['https://cdn.example.org/a.jpg','https://cdn.example.org/b.jpg']}},request=httpx.Request('GET','https://www.tikwm.com/api/'))
-        with patch.object(app.httpx,'get',return_value=response),patch.object(app,'public_url',side_effect=lambda u:u):
+        with patch.object(app.source_http,'get',return_value=response),patch.object(app,'public_url',side_effect=lambda u:u):
             self.assertEqual(len(app.tiktok_public_post('https://www.tiktok.com/t/ZPLqxkx7d/')['files']),2)
 
     def test_telegram_file_cache_resends_without_upload_and_uses_new_reply(self):
@@ -226,7 +261,7 @@ class MediaTests(unittest.TestCase):
     def test_twitter_text_only_and_photo_syndication(self):
         tweet={'id_str':'123','text':'A text-only tweet'}
         def response():return httpx.Response(200,json=tweet,request=httpx.Request('GET','https://cdn.syndication.twimg.com/'))
-        with patch.object(app.httpx,'get',side_effect=lambda *a,**k:response()),patch.object(app,'public_url',side_effect=lambda u:u):
+        with patch.object(app.source_http,'get',side_effect=lambda *a,**k:response()),patch.object(app,'public_url',side_effect=lambda u:u):
             post=app.twitter_public_post('https://x.com/user/status/123')
             self.assertEqual(app.metadata(post)['media_type'],'text')
             tweet['mediaDetails']=[{'type':'photo','media_url_https':'https://pbs.twimg.com/media/photo.jpg'}]
@@ -268,7 +303,7 @@ class MediaTests(unittest.TestCase):
           {'id':2,'title':'Cheshme Man','artist':{'name':'Dariush'},'duration':248},
           {'id':12582488,'title':'Cheshme Man','artist':{'name':'Dariush'},'duration':297,'preview':'https://cdn.example.org/preview.mp3'}]
         response=httpx.Response(200,json={'data':tracks},request=httpx.Request('GET','https://api.deezer.com/search'))
-        with patch.object(app.httpx,'get',return_value=response):match=app.deezer_catalog_match(entity)
+        with patch.object(app.source_http,'get',return_value=response):match=app.deezer_catalog_match(entity)
         self.assertEqual(match['id'],12582488)
 
 if __name__=='__main__':unittest.main()

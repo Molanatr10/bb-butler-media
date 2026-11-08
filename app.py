@@ -33,6 +33,10 @@ app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 pool = ThreadPoolExecutor(max_workers=2)
 transcode_gate = threading.Semaphore(1)
 inspect_pool = ThreadPoolExecutor(max_workers=2)
+delivery_pool = ThreadPoolExecutor(max_workers=2)
+youtube_pool = ThreadPoolExecutor(max_workers=1)
+source_http = httpx.Client(timeout=15, follow_redirects=False, limits=httpx.Limits(max_connections=12,max_keepalive_connections=8,keepalive_expiry=30))
+telegram_http = httpx.Client(timeout=120, limits=httpx.Limits(max_connections=4,max_keepalive_connections=4,keepalive_expiry=60))
 lock = threading.Lock()
 jobs = {}
 post_cache = {}
@@ -169,11 +173,19 @@ def format_height(f):
     return int(match.group(1)) if match else 0
 
 
+def youtube_native(url, directory, mode=None, height=None):
+    video=youtube_id(url)
+    if not re.fullmatch(r'[\w-]{11}',video or ''):raise MediaError('Invalid YouTube video.')
+    return run([sys.executable,str(Path(__file__).with_name('youtube_native.py')),
+                'download' if mode else 'inspect',video,mode or 'video',str(height or 720)],
+               directory,timeout=150 if mode else 35,json_output=True)
+
+
 def fallback_post(url):
     video=youtube_id(url)
     if not FALLBACK_BASE or not re.fullmatch(r'[\w-]{11}',video or ''):raise MediaError('No free YouTube fallback is available.')
     public_url(FALLBACK_BASE)
-    response=httpx.get(f'{FALLBACK_BASE}/api/v1/videos/{video}',params={'local':'true'},headers={'User-Agent':'Mozilla/5.0','Referer':FALLBACK_BASE+'/'},timeout=20)
+    response=source_http.get(f'{FALLBACK_BASE}/api/v1/videos/{video}',params={'local':'true'},headers={'User-Agent':'Mozilla/5.0','Referer':FALLBACK_BASE+'/'},timeout=20)
     if response.status_code==403:
         try:
             from curl_cffi import requests as browser_http
@@ -201,7 +213,7 @@ def deezer_catalog_match(entity):
     artist=next(iter(entity.get('artists') or []),{}).get('name','')
     expected=float(entity.get('duration') or 0)/1000
     if not title or not artist:return None
-    response=httpx.get('https://api.deezer.com/search',params={'q':artist+' '+title,'limit':10},timeout=6)
+    response=source_http.get('https://api.deezer.com/search',params={'q':artist+' '+title,'limit':10},timeout=6)
     response.raise_for_status();tracks=response.json().get('data') or []
     normalize=lambda text:' '.join(re.findall(r'\w+',str(text).casefold()))
     candidates=[]
@@ -227,7 +239,7 @@ def spotify_post(url):
     validate_source(url)
     parts=urlparse(url).path.strip('/').split('/');kind,identifier=parts[-2:]
     if kind not in ('track','episode'):raise MediaError('Please send an individual Spotify track or podcast episode rather than a playlist or album.')
-    response=httpx.get(f'https://open.spotify.com/embed/{kind}/{identifier}',timeout=20,follow_redirects=True)
+    response=source_http.get(f'https://open.spotify.com/embed/{kind}/{identifier}',timeout=20,follow_redirects=True)
     response.raise_for_status()
     match=re.search(r'<script[^>]*id="__NEXT_DATA__"[^>]*>(.*?)</script>',response.text,re.S)
     if not match:raise MediaError('Spotify metadata is temporarily unavailable.')
@@ -265,7 +277,7 @@ def twitter_public_post(url):
     from yt_dlp.jsinterp import js_number_to_string
     identifier=urlparse(url).path.rstrip('/').split('/')[-1]
     token=js_number_to_string((int(identifier)/1e15)*math.pi,36).translate(str.maketrans(dict.fromkeys('0.')))
-    response=httpx.get('https://cdn.syndication.twimg.com/tweet-result',params={'id':identifier,'lang':'en','token':token},timeout=10)
+    response=source_http.get('https://cdn.syndication.twimg.com/tweet-result',params={'id':identifier,'lang':'en','token':token},timeout=10)
     response.raise_for_status();data=response.json()
     if data.get('id_str')!=identifier:raise MediaError('Twitter did not return this public post.')
     caption=str(data.get('text') or '');files=[];heights=set()
@@ -289,12 +301,12 @@ def twitter_public_post(url):
     if len(files)>20:raise MediaError('Use a post with 20 or fewer media items.')
     if not files and not caption:raise MediaError('This tweet has no public text or media.')
     author=data.get('user') or {};name=str(author.get('name') or author.get('screen_name') or 'Twitter author')[:128]
-    return {'engine':'direct' if files else 'text','files':files,'heights':sorted(heights),'info':{'title':caption[:180] or 'Twitter post','description':caption},'source_author':{'name':name,'url':'https://x.com/i/status/'+identifier},'original_only':not heights}
+    return {'engine':'direct' if files else 'text','files':files,'heights':sorted(heights),'info':{'title':caption[:180] or 'Twitter post','description':caption},'source_author':{'name':name,'username':str(author.get('screen_name') or ''),'url':'https://x.com/i/status/'+identifier+'?mx=2'},'original_only':not heights}
 
 
 def instagram_embed_post(url):
     shortcode=urlparse(url).path.strip('/').split('/')[-1]
-    response=httpx.get(f'https://www.instagram.com/p/{shortcode}/embed/captioned/',headers={'User-Agent':'Mozilla/5.0'},timeout=12)
+    response=source_http.get(f'https://www.instagram.com/p/{shortcode}/embed/captioned/',headers={'User-Agent':'Mozilla/5.0'},timeout=12)
     response.raise_for_status()
     if len(response.content)>4*1024*1024:raise MediaError('Instagram returned too much metadata.')
     match=re.search(r'"contextJSON"\s*:\s*("(?:\\.|[^"\\])*")',response.text)
@@ -314,7 +326,7 @@ def instagram_embed_post(url):
 
 
 def tiktok_public_post(url):
-    response=httpx.get('https://www.tikwm.com/api/',params={'url':url},timeout=12)
+    response=source_http.get('https://www.tikwm.com/api/',params={'url':url},timeout=12)
     response.raise_for_status()
     data=response.json()
     if data.get('code')!=0:raise MediaError('The public TikTok downloader could not retrieve this post.')
@@ -341,6 +353,11 @@ def _extract_post_info(url,directory):
     if host.removeprefix('www.')=='instagram.com':
         try:return instagram_embed_post(url)
         except (MediaError,httpx.HTTPError,ValueError,KeyError):pass
+    if youtube_id(url):
+        try:
+            native=youtube_native(url,directory)
+            if native.get('heights'):return {'engine':'youtube-native',**native}
+        except (MediaError,ValueError):pass
     if youtube_id(url) and FALLBACK_BASE:
         try:
             return fallback_post(url)
@@ -385,6 +402,8 @@ def metadata(post):
         has_audio = any(f.get('acodec') not in ('none',None) for f in all_formats)
         if not heights and has_video:
             heights = [min(1080, int(entries[0].get('height') or 720))]
+    elif post['engine']=='youtube-native':
+        heights=post['heights'];has_video=bool(heights);has_audio=post['has_audio']
     elif post['engine']=='invidious':
         heights=sorted({format_height(f) for f in post['formats'] if str(f.get('type','')).startswith('video/') and 144<=format_height(f)<=1080})
         has_video=bool(heights);has_audio=any(str(f.get('type','')).startswith('audio/') for f in post['formats'])
@@ -415,7 +434,7 @@ def telegram(method, body, files=None):
     token = os.environ.get('TELEGRAM_BOT_TOKEN')
     if not token:
         raise MediaError('The media server is not connected to Telegram yet.')
-    with httpx.Client(timeout=120) as client:
+    with contextlib.nullcontext(telegram_http) as client:
         url = f'https://api.telegram.org/bot{token}/{method}'
         response = client.post(url, data={k: json.dumps(v) if isinstance(v, (dict, list, bool)) else str(v) for k, v in body.items()}, files=files) if files else client.post(url, json=body)
         data = response.json()
@@ -477,7 +496,7 @@ def spotify_recording(post,directory):
     query=f'{artists} {title} official audio'.strip();entries=[]
     if FALLBACK_BASE:
         try:
-            response=httpx.get(FALLBACK_BASE+'/api/v1/search',params={'q':query,'type':'video'},headers={'User-Agent':'Mozilla/5.0','Referer':FALLBACK_BASE+'/'},timeout=20)
+            response=source_http.get(FALLBACK_BASE+'/api/v1/search',params={'q':query,'type':'video'},headers={'User-Agent':'Mozilla/5.0','Referer':FALLBACK_BASE+'/'},timeout=20)
             if response.is_success:entries=response.json()[:10]
         except (httpx.HTTPError,ValueError):pass
     if not entries:
@@ -537,6 +556,9 @@ def spotify_public_recording(post,directory):
 
 
 def download_audio(post,job,directory):
+    if post['engine']=='youtube-native':
+        data=youtube_native(job.url,directory,job.mode)
+        return [('audio',normalize_audio(Path(directory)/data['files'][0],job.mode,directory,0))]
     if post['engine']=='spotify':
         if job.mode=='preview':
             url=(post.get('deezer') or {}).get('preview') or (post['entity'].get('audioPreview') or {}).get('url')
@@ -571,7 +593,14 @@ def download_audio(post,job,directory):
 def download(post, job, directory):
     if job.mode in ('audio','mp3','preview'):return download_audio(post,job,directory)
     paths = []
-    if post['engine']=='invidious':
+    if post['engine']=='youtube-native':
+        data=youtube_native(job.url,directory,'video',job.height)
+        paths=[Path(directory)/name for name in data['files']]
+        if len(paths)==2:
+            merged=Path(directory)/'video-merged.mkv'
+            run(['ffmpeg','-nostdin','-v','error','-y','-i',str(paths[0]),'-i',str(paths[1]),'-map','0:v:0','-map','1:a:0','-c','copy',str(merged)],directory,timeout=60)
+            paths=[merged]
+    elif post['engine']=='invidious':
         choices=[f for f in post['formats'] if str(f.get('type','')).startswith('video/') and f.get('url') and 0<format_height(f)<=(job.height or 720)]
         if not choices:raise MediaError('That video resolution is not available. Send the link again to refresh the options.')
         selected=max(choices,key=lambda f:(format_height(f),'mp4' in f.get('type',''),int(f.get('bitrate') or 0)))
@@ -766,5 +795,8 @@ def submit(job: Request, authorization: str = Header(default='')):
             raise HTTPException(429, 'Queue full')
         jobs[job.id] = {'status': 'running', 'created': time.time(), 'fingerprint': fingerprint}
         with cache_lock:cached=file_cache.get(media_key(job)) if job.kind=='download' else None
-        (inspect_pool if job.kind=='inspect' or cached and cached[0]>time.time() else pool).submit(execute, job)
+        host=(urlparse(job.url or '').hostname or '').removeprefix('www.')
+        direct_source=host in ('x.com','twitter.com','mobile.twitter.com','instagram.com','tiktok.com','m.tiktok.com','vm.tiktok.com','vt.tiktok.com')
+        executor=(youtube_pool if youtube_id(job.url or '') else inspect_pool) if job.kind=='inspect' else delivery_pool if cached and cached[0]>time.time() or job.kind=='download' and direct_source else pool
+        executor.submit(execute, job)
     return {'status': 'running'}
