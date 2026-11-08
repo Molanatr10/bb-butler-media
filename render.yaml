@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: bb-butler-media
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: MEDIA_BACKEND_SECRET
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: ALLOWED_CHAT_ID
+        sync: false
