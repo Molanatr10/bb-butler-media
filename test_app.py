@@ -18,7 +18,7 @@ from PIL import Image
 class MediaTests(unittest.TestCase):
     def test_native_youtube_metadata_and_download_use_bounded_subprocess(self):
         native={'info':{'id':'abcdefghijk','title':'Short','duration':65},'heights':[144,360,720],'has_audio':True}
-        with tempfile.TemporaryDirectory() as directory,patch.object(app,'run',return_value=native) as command:
+        with tempfile.TemporaryDirectory() as directory,patch.object(app,'omega_post',side_effect=app.PublicYouTubeError('unavailable')),patch.object(app,'run',return_value=native) as command:
             post=app._extract_post_info(self.job['url'],directory)
             self.assertEqual(post['engine'],'youtube-native')
             self.assertEqual(app.metadata(post)['heights'],[144,360,720])

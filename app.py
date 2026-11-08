@@ -23,6 +23,7 @@ from fastapi import FastAPI, Header, HTTPException
 from langdetect import detect, DetectorFactory
 from PIL import Image, ImageOps
 from pydantic import BaseModel, ConfigDict, Field
+from youtube_public import omega_post, PublicYouTubeError
 
 DetectorFactory.seed = 0
 Image.MAX_IMAGE_PIXELS = 25_000_000
@@ -354,6 +355,8 @@ def _extract_post_info(url,directory):
         try:return instagram_embed_post(url)
         except (MediaError,httpx.HTTPError,ValueError,KeyError):pass
     if youtube_id(url):
+        try:return omega_post(url,source_http)
+        except (PublicYouTubeError,httpx.HTTPError,ValueError,TypeError):pass
         try:
             native=youtube_native(url,directory)
             if native.get('heights'):return {'engine':'youtube-native',**native}

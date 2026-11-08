@@ -1,3 +1,7 @@
+## Public YouTube fallback candidate
+
+YouTube first tries OmegaTech's documented public no-key API (https://api.omegatech.app/docs), then the existing anonymous native and Invidious routes. Only bounded public Google video HTTPS addresses are accepted. The public API currently supplies one original MP4 stream, so it auto-sends without inventing resolution choices; MP3/M4A use the existing guarded audio conversion. The supplied Short was verified locally as a complete 360x640 H.264/AAC video; cloud verification is required before calling it working there. No account key, card or payment is used for this route. Public-provider availability remains best-effort.
+
 # BB Butler media backend
 
 Authenticated media processing for Bmal Bmale Butler. Built with yt-dlp, gallery-dl, FFmpeg and Pillow. No ads, sponsored posts, required channels or third-party Telegram bots.

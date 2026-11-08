@@ -5,7 +5,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg ca-certi
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY app.py youtube_native.py .
+COPY app.py youtube_native.py youtube_public.py .
 RUN useradd --create-home app
 USER app
 ENV PORT=10000 PYTHONUNBUFFERED=1
