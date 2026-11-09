@@ -97,5 +97,5 @@ def omega_post(url, client):
     # This endpoint returns one original stream; do not invent a resolution.
     title = title.strip()[:180]
     return {'engine': 'direct', 'files': [(address, {'extension': 'mp4'})],
-            'original_only': True,
+            'original_only': True, 'max_video_duration': MAX_DURATION,
             'info': {'id': video_id, 'title': title, 'description': title, 'duration': duration}}

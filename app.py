@@ -602,13 +602,14 @@ def album_batches(items):
     return groups
 
 
-def normalize_video(source, height, directory, index):
+def normalize_video(source, height, directory, index, *, max_duration=600):
     if source.stat().st_size > MAX_VIDEO:
         raise MediaError('This video is too large. Choose a lower resolution.')
     output = Path(directory) / f'normalized-{index}.mp4'
     probe=run(['ffprobe','-v','error','-show_entries','format=duration:stream=codec_name,codec_type,width,height','-of','json',str(source)],directory,json_output=True)
-    if float(probe.get('format',{}).get('duration',601))>600:
-        raise MediaError('This free downloader supports videos up to 10 minutes.')
+    duration = float(probe.get('format', {}).get('duration', 0))
+    if not 0 < duration <= max_duration:
+        raise MediaError(f'This download needs a valid video duration of up to {max_duration // 60} minutes.')
     streams=probe.get('streams',[])
     video=next((s for s in streams if s.get('codec_type')=='video'),{})
     audio=next((s for s in streams if s.get('codec_type')=='audio'),{})
@@ -861,7 +862,7 @@ def download(post, job, directory):
     normalized = []
     for i, p in enumerate(paths):
         if p.suffix in ('.mp4', '.webm', '.mkv', '.mov','.bin'):
-            normalized.append(('video', normalize_video(p, job.height, directory, i)))
+            normalized.append(('video', normalize_video(p, job.height, directory, i, max_duration=post.get('max_video_duration', 600))))
         else:
             target = Path(directory) / f'photo-{i}.jpg'
             with Image.open(p) as im:
@@ -1017,7 +1018,7 @@ def execute(job):
 
 @app.get('/health')
 def health():
-    return {'ok': True, 'release': '2026-11-08-youtube-duration'}
+    return {'ok': True, 'release': '2026-11-08-youtube-duration-v2'}
 
 
 @app.post('/jobs')
