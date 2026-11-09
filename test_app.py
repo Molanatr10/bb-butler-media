@@ -325,6 +325,25 @@ class MediaTests(unittest.TestCase):
                 with self.assertRaisesRegex(app.MediaError,'10 minutes'):app.normalize_video(source,720,directory,0)
                 self.assertEqual(run.call_count,1)
 
+    def test_portrait_instagram_menu_lists_both_source_short_edges(self):
+        formats=[{'width':720,'height':1280,'vcodec':'vp9'},{'width':1080,'height':1920,'vcodec':'vp9'}]
+        post={'engine':'yt-dlp','info':{'title':'Reel'},'entries':[{'formats':formats}],'portrait_resolution':True}
+        self.assertEqual(app.metadata(post)['heights'],[720,1080])
+
+    def test_successful_ffmpeg_exit_cannot_send_a_truncated_video(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source=Path(directory)/'source.mp4'
+            source.write_bytes(b'test')
+            probe={'format':{'duration':'10'},'streams':[{'codec_type':'video','codec_name':'h264','width':720,'height':1280}]}
+            def fake_run(command,*args,**kwargs):
+                if command[0]=='ffmpeg':
+                    Path(command[-1]).write_bytes(b'partial')
+                    return None
+                return probe if command[-1]==str(source) else {'format':{'duration':'3.4'}}
+            with patch.object(app,'run',side_effect=fake_run):
+                with self.assertRaisesRegex(app.MediaError,'prepared in full'):
+                    app.normalize_video(source,720,directory,0)
+
     def test_cloud_verification_never_sends_a_telegram_message(self):
         job=app.Request(**{**self.job,'kind':'verify'})
         app.jobs[job.id]={'status':'running'}

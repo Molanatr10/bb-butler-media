@@ -465,7 +465,8 @@ def _extract_post_info(url,directory):
         if any(e.get('duration', 0) and e['duration'] > 600 for e in entries):
             raise MediaError('This free downloader supports videos up to 10 minutes.')
         if any(e.get('formats') or e.get('url') for e in entries):
-            return {'engine': 'yt-dlp', 'info': info, 'entries': entries}
+            return {'engine': 'yt-dlp', 'info': info, 'entries': entries,
+                    'portrait_resolution': host.removeprefix('www.')=='instagram.com'}
     except MediaError:
         # Gallery support covers photo-only and mixed-media posts.
         if 'youtu' in (urlparse(url).hostname or ''):
@@ -497,6 +498,7 @@ def format_bytes(format,duration):
 
 def video_format_sizes(post,heights):
     if post.get('video_sizes'):return post['video_sizes']
+    if post.get('portrait_resolution'):return {}
     sizes={}
     if post['engine'] not in ('yt-dlp','invidious'):return sizes
     entries=post['entries'] if post['engine']=='yt-dlp' else [post]
@@ -526,6 +528,12 @@ def video_format_sizes(post,heights):
     return sizes
 
 
+def source_resolution(format, portrait=False):
+    height = int(format.get('height') or 0)
+    width = int(format.get('width') or 0)
+    return min(width, height) if portrait and width and height else height
+
+
 def metadata(post):
     info = post['info']
     caption = str(info.get('description') or info.get('content') or info.get('caption') or info.get('title') or '')[:6000]
@@ -539,11 +547,13 @@ def metadata(post):
         entries = post['entries']
         all_formats=[f for e in entries for f in e.get('formats', [])]
         formats = [f for f in all_formats if f.get('vcodec') not in ('none',None)]
-        heights = sorted({int(f['height']) for f in formats if f.get('height') and 144 <= f['height'] <= 1080})
+        portrait=post.get('portrait_resolution',False)
+        resolutions={source_resolution(f,portrait) for f in formats}
+        heights=sorted(size for size in resolutions if 144 <= size <= 1080)
         has_video = bool(formats) or any(e.get('height') for e in entries)
         has_audio = any(f.get('acodec') not in ('none',None) for f in all_formats)
         if not heights and has_video:
-            heights = [min(1080, int(entries[0].get('height') or 720))]
+            heights = [min(1080, source_resolution(entries[0],portrait) or 720)]
     elif post['engine']=='youtube-native':
         heights=post['heights'];has_video=bool(heights);has_audio=post['has_audio']
     elif post['engine']=='invidious':
@@ -613,11 +623,24 @@ def normalize_video(source, height, directory, index, *, max_duration=600):
     streams=probe.get('streams',[])
     video=next((s for s in streams if s.get('codec_type')=='video'),{})
     audio=next((s for s in streams if s.get('codec_type')=='audio'),{})
-    compatible=video.get('codec_name')=='h264' and min(video.get('width',video.get('height',99999)),video.get('height',99999))<=(height or 1080) and audio.get('codec_name','aac') in ('aac','mp3')
-    codec_args=['-c','copy'] if compatible else ['-vf',f"scale=-2:'max(2,trunc(min({height or 1080},ih)/2)*2)'",'-c:v','libx264','-threads','1','-filter_threads','1','-preset','ultrafast','-crf','26','-c:a','aac']
+    width=video.get('width') or 99999
+    source_height=video.get('height') or 99999
+    limit=height or 1080
+    compatible=video.get('codec_name')=='h264' and min(width,source_height)<=limit and audio.get('codec_name','aac') in ('aac','mp3')
+    if compatible:
+        codec_args=['-c','copy']
+    else:
+        dimension='iw' if width<source_height else 'ih'
+        short_edge=f"'max(2,trunc(min({limit},{dimension})/2)*2)'"
+        scale=f'scale={short_edge}:-2' if dimension=='iw' else f'scale=-2:{short_edge}'
+        codec_args=['-vf',scale,'-c:v','libx264','-threads','1','-filter_threads','1','-preset','ultrafast','-crf','26','-c:a','aac']
     run(['ffmpeg','-nostdin','-v','error','-y','-i',str(source),*codec_args,'-movflags','+faststart','-fs',str(MAX_VIDEO+1),str(output)],directory,timeout=240)
     if output.stat().st_size > MAX_VIDEO:
         raise MediaError('This video is too large. Choose a lower resolution.')
+    result=run(['ffprobe','-v','error','-show_entries','format=duration','-of','json',str(output)],directory,json_output=True)
+    output_duration=float(result.get('format',{}).get('duration',0))
+    if not math.isfinite(output_duration) or output_duration<=0 or output_duration+0.75<duration:
+        raise MediaError('This video could not be prepared in full. Try a lower resolution or a shorter video.')
     return output
 
 
@@ -1025,7 +1048,7 @@ def execute(job):
 
 @app.get('/health')
 def health():
-    return {'ok': True, 'release': '2026-11-09-instagram-portrait'}
+    return {'ok': True, 'release': '2026-11-09-video-integrity'}
 
 
 @app.post('/jobs')
