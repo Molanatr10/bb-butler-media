@@ -913,9 +913,32 @@ def caption_chunks(text):
     if parts:yield ''.join(parts),start
 
 
+def instagram_video_fields(path, index, stack, files):
+    directory=path.parent
+    probe=run(['ffprobe','-v','error','-select_streams','v:0','-show_entries',
+               'stream=width,height:format=duration','-of','json',str(path)],directory,json_output=True)
+    stream=probe['streams'][0]
+    fields={'width':stream['width'],'height':stream['height'],
+            'duration':max(1,round(float(probe['format']['duration'])))}
+    preview=directory / f'preview-{index}.jpg'
+    try:
+        run(['ffmpeg','-nostdin','-v','error','-y','-ss','0.2','-i',str(path),
+             '-frames:v','1','-vf','scale=320:320:force_original_aspect_ratio=decrease',
+             '-threads','1','-q:v','4',str(preview)],directory,timeout=12)
+        if preview.exists() and 0<preview.stat().st_size<200000:
+            for field in ('thumbnail','cover'):
+                key=f'{field}{index}'
+                files[key]=(preview.name,stack.enter_context(preview.open('rb')),'image/jpeg')
+                fields[field]=f'attach://{key}'
+    except MediaError:
+        pass
+    return fields
+
+
 def deliver(items, job, cached=False, remote=False):
     ids = [];receipts=[]
     caption = job.caption
+    instagram=(urlparse(job.url or '').hostname or '').removeprefix('www.')=='instagram.com'
     def send(method,payload,files=None):
         try:return telegram(method,payload,files)
         except TelegramDeliveryError as error:
@@ -932,6 +955,8 @@ def deliver(items, job, cached=False, remote=False):
                     if job.caption_entities:item['caption_entities']=job.caption_entities
                 if kind == 'video':
                     item['supports_streaming'] = True
+                    if instagram and not (cached or remote):
+                        item.update(instagram_video_fields(path,i,stack,files))
                 media.append(item)
             if len(batch) > 1:
                 sent = send('sendMediaGroup', {**base_body(job), 'media': media}, files)
@@ -943,7 +968,8 @@ def deliver(items, job, cached=False, remote=False):
                 kind, _ = batch[0]
                 body = {**base_body(job), kind: media[0]['media'], 'caption': caption if index == 0 and len(caption) <= 1024 else ''}
                 if index==0 and len(caption)<=1024 and job.caption_entities:body['caption_entities']=job.caption_entities
-                if kind == 'video': body['supports_streaming'] = True
+                if kind == 'video':
+                    body.update({key:value for key,value in media[0].items() if key not in ('type','media','caption','caption_entities')})
                 sent = send({'video':'sendVideo','audio':'sendAudio','photo':'sendPhoto'}[kind], body, files)
                 ids.append(sent['message_id'])
                 value=sent.get(kind);value=value[-1] if isinstance(value,list) and value else value
@@ -967,12 +993,18 @@ def deliver(items, job, cached=False, remote=False):
 
 def direct_items(post,job):
     if post.get('engine')!='direct' or job.mode not in ('video','images'):return None
+    files=post.get('files') or []
+    video_extensions=('mp4','mov','webm')
+    # Prepare Instagram videos locally so the upload can include a preview.
+    instagram=(urlparse(job.url or '').hostname or '').removeprefix('www.')=='instagram.com'
+    if instagram and any(meta.get('extension') in video_extensions for _,meta in files):
+        return None
     items=[]
-    for address,meta in post.get('files') or []:
+    for address,meta in files:
         if meta.get('variants'):
             choices=[v for v in meta['variants'] if v['height']<=(job.height or 1080)] or meta['variants']
             address=max(choices,key=lambda v:(v['height'],v['bitrate']))['url']
-        items.append(('video' if meta.get('extension') in ('mp4','mov','webm') else 'photo',public_url(address)))
+        items.append(('video' if meta.get('extension') in video_extensions else 'photo',public_url(address)))
     return items or None
 
 
@@ -1022,6 +1054,13 @@ def execute(job):
                 elif job.kind=='verify':
                     files=download(post,job,directory)
                     result={'verification_only':True,'metadata':metadata(post),'files':[{'kind':kind,'bytes':p.stat().st_size,'sha256':hashlib.sha256(p.read_bytes()).hexdigest()} for kind,p in files]}
+                    if (urlparse(job.url or '').hostname or '').removeprefix('www.')=='instagram.com':
+                        with contextlib.ExitStack() as stack:
+                            for index,(kind,path) in enumerate(files):
+                                if kind=='video':
+                                    fields=instagram_video_fields(path,index,stack,{})
+                                    result['files'][index]['preview']={key:fields[key] for key in ('duration','width','height')}
+                                    result['files'][index]['preview']['has_cover']='cover' in fields
                 else:
                     result=None;remote=direct_items(post,job)
                     if remote:
@@ -1048,7 +1087,7 @@ def execute(job):
 
 @app.get('/health')
 def health():
-    return {'ok': True, 'release': '2026-11-09-video-integrity'}
+    return {'ok': True, 'release': '2026-11-09-instagram-previews'}
 
 
 @app.post('/jobs')

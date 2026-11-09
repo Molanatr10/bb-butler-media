@@ -578,6 +578,25 @@ class MediaTests(unittest.TestCase):
         self.assertEqual(api.call_args.args[2],{})
         self.assertEqual(api.call_args.args[1]['caption_entities'][0]['url'],url)
 
+    def test_instagram_reel_upload_includes_mobile_preview_fields(self):
+        job=app.Request(**{**self.job,'kind':'download','mode':'video','url':'https://www.instagram.com/reel/Dff_v1LxxJn/'})
+        post={'engine':'direct','files':[('https://cdn.example.org/reel.mp4',{'extension':'mp4'})]}
+        self.assertIsNone(app.direct_items(post,job))
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)/'reel.mp4'
+            path.write_bytes(b'video')
+            def probe(command,*args,**kwargs):
+                if command[0]=='ffprobe':return {'streams':[{'width':720,'height':1280}],'format':{'duration':'35.3'}}
+                Path(command[-1]).write_bytes(b'preview')
+            with patch.object(app,'run',side_effect=probe),patch.object(app,'telegram',return_value={'message_id':8}) as api:
+                app.deliver([('video',path)],job)
+            method,body,files=api.call_args.args
+        self.assertEqual(method,'sendVideo')
+        self.assertEqual((body['duration'],body['width'],body['height']),(35,720,1280))
+        self.assertTrue(body['supports_streaming'])
+        self.assertIn(body['cover'].removeprefix('attach://'),files)
+        self.assertIn(body['thumbnail'].removeprefix('attach://'),files)
+
 
     def test_deezer_catalog_rejects_wrong_artist_and_version(self):
         entity={'title':'Cheshme Man','artists':[{'name':'Dariush'}],'duration':297080}
