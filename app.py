@@ -844,6 +844,13 @@ def download(post, job, directory):
     elif post['engine'] == 'yt-dlp':
         height = job.height or 720
         fmt = f'bv*[height<={height}][ext=mp4]+ba[ext=m4a]/b[height<={height}][ext=mp4]/bv*[height<={height}]+ba/b[height<={height}]'
+        if (urlparse(job.url or '').hostname or '').removeprefix('www.')=='instagram.com':
+            # Instagram reports portrait DASH dimensions by their long edge and
+            # may omit dimensions entirely on its ready-to-send MP4 variants.
+            # Normalize the downloaded file to the requested short edge below.
+            portrait = f'bv*[width<={height}][ext=mp4]+ba[ext=m4a]'
+            progressive = f'b[ext=mp4][width<=?{height}][height<=?{max(1920,height)}]'
+            fmt = f'{progressive}/{fmt}/{portrait}'
         run(ytdlp_args() + ['--max-filesize', '45M', '-f', fmt, '--merge-output-format', 'mp4', '-o', str(Path(directory) / 'video-%(autonumber)03d.%(ext)s'), *native_input(post,job.url,directory)], directory, timeout=240)
         paths = sorted(p for p in Path(directory).glob('video-*') if p.suffix in ('.mp4', '.webm', '.mkv', '.mov'))
     else:
@@ -1018,7 +1025,7 @@ def execute(job):
 
 @app.get('/health')
 def health():
-    return {'ok': True, 'release': '2026-11-08-youtube-30min'}
+    return {'ok': True, 'release': '2026-11-09-instagram-portrait'}
 
 
 @app.post('/jobs')
