@@ -7,10 +7,14 @@ from urllib.parse import parse_qs, urlparse
 
 API_URL = 'https://api.omegatech.app/api/download/YouTube'
 MAX_BYTES = 45 * 1024 * 1024
-MAX_DURATION = 600
+MAX_DURATION = 900
 
 
 class PublicYouTubeError(ValueError):
+    pass
+
+
+class PublicYouTubeLimitError(PublicYouTubeError):
     pass
 
 
@@ -54,11 +58,15 @@ def _playback_url(value):
 def _bounded_number(values, maximum, label):
     try:
         numbers = [float(value) for value in values if value is not None]
-        if not numbers or any(not math.isfinite(value) or not 0 < value <= maximum for value in numbers):
+        if not numbers or any(not math.isfinite(value) or value <= 0 for value in numbers):
             raise ValueError('Invalid bounds')
-        return max(numbers)
     except (TypeError, ValueError, OverflowError):
-        raise PublicYouTubeError(f'The public YouTube service returned an invalid or oversized {label}.') from None
+        raise PublicYouTubeError(f'The public YouTube service returned an invalid {label}.') from None
+    largest = max(numbers)
+    if largest > maximum:
+        limit = f'{maximum // 60} minutes' if label == 'duration' else f'{maximum // (1024 * 1024)} MiB'
+        raise PublicYouTubeLimitError(f'The available YouTube download exceeds the {limit} limit.')
+    return largest
 
 
 def omega_post(url, client):

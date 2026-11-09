@@ -24,7 +24,7 @@ from fastapi import FastAPI, Header, HTTPException
 from langdetect import detect, DetectorFactory
 from PIL import Image, ImageOps
 from pydantic import BaseModel, ConfigDict, Field
-from youtube_public import omega_post, PublicYouTubeError
+from youtube_public import omega_post, PublicYouTubeError, PublicYouTubeLimitError
 from youtube_audio_public import public_audio_post, PublicAudioUnavailable
 from youtube_audio_proxy import download_proxy_audio, ProxyAudioUnavailable
 
@@ -444,8 +444,10 @@ def _extract_post_info(url,directory):
     if host.removeprefix('www.')=='instagram.com':
         try:return instagram_embed_post(url)
         except (MediaError,httpx.HTTPError,ValueError,KeyError):pass
+    public_limit = None
     if youtube_id(url):
         try:return omega_post(url,source_http)
+        except PublicYouTubeLimitError as error:public_limit = str(error)
         except (PublicYouTubeError,httpx.HTTPError,ValueError,TypeError):pass
         try:
             native=youtube_native(url,directory)
@@ -467,6 +469,8 @@ def _extract_post_info(url,directory):
     except MediaError:
         # Gallery support covers photo-only and mixed-media posts.
         if 'youtu' in (urlparse(url).hostname or ''):
+            if public_limit:
+                raise MediaError(public_limit) from None
             raise
     raw = run([sys.executable, '-m', 'gallery_dl', '--config-ignore', '--dump-json', '--range', '1-21', '--', url], directory, timeout=35, json_output=True)
     files = [(r[1], r[2]) for r in raw if isinstance(r, list) and len(r) > 2 and r[0] == 3]
@@ -1013,7 +1017,7 @@ def execute(job):
 
 @app.get('/health')
 def health():
-    return {'ok': True, 'release': '2026-11-08-audio-diagnostics'}
+    return {'ok': True, 'release': '2026-11-08-youtube-duration'}
 
 
 @app.post('/jobs')

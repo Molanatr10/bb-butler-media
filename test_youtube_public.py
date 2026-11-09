@@ -28,6 +28,11 @@ class PublicYouTubeTests(unittest.TestCase):
         self.assertTrue(post['original_only'])
         self.assertNotIn('heights', post)
 
+    def test_accepts_the_reported_thirteen_minute_video_within_size_limit(self):
+        self.data['data']['url'] = self.media.replace('65.344', '827.884').replace('4847766', '43314847')
+        self.data['data']['size'] = 43314787
+        self.assertEqual(omega_post(self.url, self.client)['info']['duration'], 827.884)
+
     def test_source_and_playback_addresses_are_strictly_restricted(self):
         for url in ['https://youtube.com.evil.test/watch?v=QyS1O40wvFI',
                     'http://youtu.be/QyS1O40wvFI', 'https://youtube.com:443/watch?v=QyS1O40wvFI',
@@ -46,7 +51,7 @@ class PublicYouTubeTests(unittest.TestCase):
             with self.assertRaises(PublicYouTubeError):omega_post(self.url, self.client)
 
     def test_real_size_and_duration_bounds_cannot_be_hidden_by_reported_metadata(self):
-        for replacement in ['dur=601', 'dur=nan', 'dur=-1']:
+        for replacement in ['dur=901', 'dur=nan', 'dur=-1']:
             self.data['data']['url'] = self.media.replace('dur=65.344', replacement)
             with self.subTest(replacement=replacement), self.assertRaises(PublicYouTubeError):
                 omega_post(self.url, self.client)
