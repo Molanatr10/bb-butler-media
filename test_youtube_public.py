@@ -51,7 +51,7 @@ class PublicYouTubeTests(unittest.TestCase):
             with self.assertRaises(PublicYouTubeError):omega_post(self.url, self.client)
 
     def test_real_size_and_duration_bounds_cannot_be_hidden_by_reported_metadata(self):
-        for replacement in ['dur=901', 'dur=nan', 'dur=-1']:
+        for replacement in ['dur=1801', 'dur=nan', 'dur=-1']:
             self.data['data']['url'] = self.media.replace('dur=65.344', replacement)
             with self.subTest(replacement=replacement), self.assertRaises(PublicYouTubeError):
                 omega_post(self.url, self.client)

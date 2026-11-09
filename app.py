@@ -1018,7 +1018,7 @@ def execute(job):
 
 @app.get('/health')
 def health():
-    return {'ok': True, 'release': '2026-11-08-youtube-duration-v2'}
+    return {'ok': True, 'release': '2026-11-08-youtube-30min'}
 
 
 @app.post('/jobs')

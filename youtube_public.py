@@ -7,7 +7,7 @@ from urllib.parse import parse_qs, urlparse
 
 API_URL = 'https://api.omegatech.app/api/download/YouTube'
 MAX_BYTES = 45 * 1024 * 1024
-MAX_DURATION = 900
+MAX_DURATION = 1800
 
 
 class PublicYouTubeError(ValueError):
