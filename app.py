@@ -73,6 +73,7 @@ class Request(BaseModel):
     height: int | None = Field(default=None, ge=144, le=1080)
     file_id: str | None = Field(default=None, max_length=512)
     caption: str = Field(default='', max_length=16000)
+    with_comments: bool = False
     language: str | None = Field(default=None, max_length=16)
     caption_entities: list[dict] = Field(default_factory=list,max_length=10)
     mode: str = Field(default='video', pattern=r'^(video|images|audio|mp3|preview)$')
@@ -85,8 +86,8 @@ def validate_source(url):
         'youtube.com': r'/(watch|shorts/[\w-]+|live/[\w-]+)/?',
         'm.youtube.com': r'/(watch|shorts/[\w-]+)/?',
         'youtu.be': r'/[\w-]+/?',
-        'tiktok.com': r'/(?:@[^/]+/(?:video|photo)/\d+|t/[A-Za-z0-9]+|v/\d+\.html|embed/v2/\d+)/?',
-        'm.tiktok.com': r'/(?:@[^/]+/(?:video|photo)/\d+|t/[A-Za-z0-9]+|v/\d+\.html)/?',
+        'tiktok.com': r'/(?:@[^/]+/(?:video|photo)/\d+|t/[A-Za-z0-9_-]+|v/\d+\.html|embed/v2/\d+)/?',
+        'm.tiktok.com': r'/(?:@[^/]+/(?:video|photo)/\d+|t/[A-Za-z0-9_-]+|v/\d+\.html)/?',
         'vm.tiktok.com': r'/[\w-]+/?', 'vt.tiktok.com': r'/[\w-]+/?',
         'instagram.com': r'/(p|reel|reels|tv)/[\w-]+/?',
         'x.com': r'/[^/]+/status/\d+/?', 'twitter.com': r'/[^/]+/status/\d+/?',
@@ -430,6 +431,33 @@ def tiktok_public_post(url):
         if address:files=[(public_url(address),{'extension':'mp4'})]
     if not files or len(files)>20:raise MediaError('No supported TikTok media was found.')
     return {'engine':'direct','files':files,'info':{'title':data.get('title') or 'TikTok media','description':data.get('title') or ''},'original_only':True}
+
+
+def tiktok_comment_caption(url, caption):
+    comments=[]
+    try:
+        response=source_http.get('https://www.tikwm.com/api/comment/list',
+                                 params={'url':url,'count':6,'cursor':0},timeout=5)
+        response.raise_for_status()
+        payload=response.json()
+        if payload.get('code')==0:
+            for entry in (payload.get('data') or {}).get('comments',[])[:6]:
+                value=entry.get('text')
+                if not isinstance(value,str):continue
+                value=' '.join(re.sub(r'(?:https?://|www\.)\S+','',value).split())
+                if not value or value in comments:continue
+                comments.append(value)
+                if len(comments)==3:break
+    except (httpx.HTTPError,ValueError,TypeError,AttributeError):
+        pass
+
+    def shorten(value, units):
+        encoded=value.encode('utf-16-le',errors='replace')
+        if len(encoded)<=2*units:return value
+        return encoded[:2*(units-1)].decode('utf-16-le',errors='ignore').rstrip()+'…'
+
+    section='💬 TikTok comments\n'+'\n'.join('• '+shorten(value,150) for value in comments) if comments else '💬 TikTok comments are unavailable.'
+    return ('\n\n'.join(filter(None,(shorten(caption,530),section))),len(comments))
 
 
 def _extract_post_info(url,directory):
@@ -1026,6 +1054,11 @@ def notify_completion(job):
 def execute(job):
     began=time.monotonic();timings={'queue_ms':round((time.time()-jobs.get(job.id,{}).get('created',time.time()))*1000)}
     try:
+        comment_count=0
+        host=(urlparse(job.url or '').hostname or '').removeprefix('www.')
+        if job.with_comments and job.kind in ('download','verify') and job.mode=='video' and host in ('tiktok.com','m.tiktok.com','vm.tiktok.com','vt.tiktok.com'):
+            caption,comment_count=tiktok_comment_caption(job.url,job.caption)
+            job=job.model_copy(update={'caption':caption,'caption_entities':[]})
         with tempfile.TemporaryDirectory(prefix='bb-media-') as directory:
             if job.kind == 'sticker':
                 f = telegram('getFile', {'file_id': job.file_id})
@@ -1054,6 +1087,7 @@ def execute(job):
                 elif job.kind=='verify':
                     files=download(post,job,directory)
                     result={'verification_only':True,'metadata':metadata(post),'files':[{'kind':kind,'bytes':p.stat().st_size,'sha256':hashlib.sha256(p.read_bytes()).hexdigest()} for kind,p in files]}
+                    if job.with_comments:result['comment_count']=comment_count
                     if (urlparse(job.url or '').hostname or '').removeprefix('www.')=='instagram.com':
                         with contextlib.ExitStack() as stack:
                             for index,(kind,path) in enumerate(files):
@@ -1087,7 +1121,7 @@ def execute(job):
 
 @app.get('/health')
 def health():
-    return {'ok': True, 'release': '2026-11-09-instagram-previews'}
+    return {'ok': True, 'release': '2026-11-09-tiktok-comments'}
 
 
 @app.post('/jobs')
