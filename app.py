@@ -528,6 +528,8 @@ def _extract_post_info(url,directory):
     raw = run([sys.executable, '-m', 'gallery_dl', '--config-ignore', '--dump-json', '--range', '1-21', '--', url], directory, timeout=35, json_output=True)
     files = [(r[1], r[2]) for r in raw if isinstance(r, list) and len(r) > 2 and r[0] == 3]
     if not files:
+        if host.removeprefix('www.')=='instagram.com' and urlparse(url).path.startswith(('/reel/','/reels/')):
+            raise MediaError('Instagram did not provide a playable video for this reel. Open the original link in Instagram to check access.')
         raise MediaError('No downloadable media found. The post may require login or be blocked by the source site.')
     if len(files) > 20:
         raise MediaError('Use a post with 20 or fewer media items.')
@@ -1139,7 +1141,7 @@ def execute(job):
 
 @app.get('/health')
 def health():
-    return {'ok': True, 'release': '2026-11-10-instagram-audience'}
+    return {'ok': True, 'release': '2026-11-10-instagram-access'}
 
 
 @app.post('/jobs')
