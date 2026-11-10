@@ -55,6 +55,10 @@ class MediaError(Exception):
     pass
 
 
+class InstagramAudienceError(MediaError):
+    pass
+
+
 class TelegramDeliveryError(MediaError):
     def __init__(self,code):
         super().__init__('Telegram could not deliver this media. Try a smaller file or lower resolution.')
@@ -143,6 +147,8 @@ def run(command, directory, timeout=180, json_output=False):
                 result = subprocess.run(command, cwd=directory, stdout=f, stderr=stderr, timeout=timeout, check=False)
         if result.returncode:
             reason=errors.read_text(encoding='utf-8',errors='replace')[-65536:].lower()
+            if '[instagram]' in reason and "can't be seen by certain audiences" in reason:
+                raise InstagramAudienceError('Instagram limits who can view this reel. Open the original link in Instagram to check access.')
             if 'sign in to confirm' in reason or 'confirm you’re not a bot' in reason:
                 raise MediaError('YouTube is blocking requests from this cloud server and requires sign-in. This video cannot currently be downloaded here.')
             if 'http error 429' in reason or 'too many requests' in reason:
@@ -511,6 +517,8 @@ def _extract_post_info(url,directory):
         if any(e.get('formats') or e.get('url') for e in entries):
             return {'engine': 'yt-dlp', 'info': info, 'entries': entries,
                     'portrait_resolution': host.removeprefix('www.')=='instagram.com'}
+    except InstagramAudienceError:
+        raise
     except MediaError:
         # Gallery support covers photo-only and mixed-media posts.
         if 'youtu' in (urlparse(url).hostname or ''):
@@ -1131,7 +1139,7 @@ def execute(job):
 
 @app.get('/health')
 def health():
-    return {'ok': True, 'release': '2026-11-09-tiktok-shared-comment'}
+    return {'ok': True, 'release': '2026-11-10-instagram-audience'}
 
 
 @app.post('/jobs')
