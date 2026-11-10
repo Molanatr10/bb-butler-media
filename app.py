@@ -16,7 +16,7 @@ import threading
 import time
 from html.parser import HTMLParser
 from concurrent.futures import ThreadPoolExecutor
-from urllib.parse import urlparse, parse_qs, urlencode
+from urllib.parse import urlparse, parse_qs, urlencode, urljoin
 from difflib import SequenceMatcher
 
 import httpx
@@ -73,7 +73,6 @@ class Request(BaseModel):
     height: int | None = Field(default=None, ge=144, le=1080)
     file_id: str | None = Field(default=None, max_length=512)
     caption: str = Field(default='', max_length=16000)
-    with_comments: bool = False
     language: str | None = Field(default=None, max_length=16)
     caption_entities: list[dict] = Field(default_factory=list,max_length=10)
     mode: str = Field(default='video', pattern=r'^(video|images|audio|mp3|preview)$')
@@ -430,34 +429,51 @@ def tiktok_public_post(url):
         address=data.get('play') or data.get('hdplay')
         if address:files=[(public_url(address),{'extension':'mp4'})]
     if not files or len(files)>20:raise MediaError('No supported TikTok media was found.')
-    return {'engine':'direct','files':files,'info':{'title':data.get('title') or 'TikTok media','description':data.get('title') or ''},'original_only':True}
+    post={'engine':'direct','files':files,'info':{'title':data.get('title') or 'TikTok media','description':data.get('title') or ''},'original_only':True}
+    if not data.get('images'):
+        comment=tiktok_shared_comment(url,str(data.get('id') or ''))
+        if comment is not None:post['shared_comment']=comment
+    return post
 
 
-def tiktok_comment_caption(url, caption):
-    comments=[]
+def tiktok_shared_comment(url, video_id):
+    share_url=url
+    comment_id=None
     try:
-        response=source_http.get('https://www.tikwm.com/api/comment/list',
-                                 params={'url':url,'count':6,'cursor':0},timeout=5)
-        response.raise_for_status()
-        payload=response.json()
-        if payload.get('code')==0:
-            for entry in (payload.get('data') or {}).get('comments',[])[:6]:
+        for _ in range(3):
+            parsed=urlparse(share_url)
+            host=(parsed.hostname or '').removeprefix('www.')
+            if host not in ('tiktok.com','m.tiktok.com','vm.tiktok.com','vt.tiktok.com'):return None
+            validate_source(share_url)
+            query=parse_qs(parsed.query)
+            comment_id=next((query[key][0] for key in ('reply_comment_id','share_comment_id','comment_id','cid')
+                             if re.fullmatch(r'\d{1,25}',query.get(key,[''])[0])),None)
+            if comment_id:break
+            if not (parsed.path.startswith('/t/') or host in ('vm.tiktok.com','vt.tiktok.com')):return None
+            response=source_http.get(share_url,timeout=3,follow_redirects=False)
+            if not response.is_redirect or not response.headers.get('location'):return None
+            share_url=urljoin(share_url,response.headers['location'])
+        if not comment_id:return None
+        cursor=0
+        for _ in range(3):
+            response=source_http.get('https://www.tikwm.com/api/comment/list',
+                                     params={'url':url,'count':20,'cursor':cursor},timeout=4)
+            response.raise_for_status()
+            payload=response.json()
+            if payload.get('code')!=0:break
+            data=payload.get('data') or {}
+            for entry in data.get('comments',[]):
+                if str(entry.get('id'))!=comment_id or str(entry.get('video_id'))!=video_id:continue
                 value=entry.get('text')
-                if not isinstance(value,str):continue
-                value=' '.join(re.sub(r'(?:https?://|www\.)\S+','',value).split())
-                if not value or value in comments:continue
-                comments.append(value)
-                if len(comments)==3:break
-    except (httpx.HTTPError,ValueError,TypeError,AttributeError):
+                if isinstance(value,str) and value.strip():
+                    encoded=value.strip().encode('utf-16-le',errors='replace')
+                    return encoded[:1960].decode('utf-16-le',errors='ignore')+('…' if len(encoded)>1960 else '')
+            next_cursor=data.get('cursor')
+            if not data.get('hasMore') or not isinstance(next_cursor,(str,int)) or next_cursor==cursor:break
+            cursor=next_cursor
+    except (httpx.HTTPError,MediaError,ValueError,TypeError,AttributeError):
         pass
-
-    def shorten(value, units):
-        encoded=value.encode('utf-16-le',errors='replace')
-        if len(encoded)<=2*units:return value
-        return encoded[:2*(units-1)].decode('utf-16-le',errors='ignore').rstrip()+'…'
-
-    section='💬 TikTok comments\n'+'\n'.join('• '+shorten(value,150) for value in comments) if comments else '💬 TikTok comments are unavailable.'
-    return ('\n\n'.join(filter(None,(shorten(caption,530),section))),len(comments))
+    return '' if comment_id else None
 
 
 def _extract_post_info(url,directory):
@@ -594,7 +610,7 @@ def metadata(post):
         has_video = any(str(meta.get('extension') or '').lower() in ('mp4', 'webm', 'mov') for _, meta in post['files'])
         heights = post.get('heights',[] if post.get('original_only') else [360,480,720,1080] if has_video else [])
         has_audio=has_video
-    return {'caption': caption, 'title': title, 'language': language, 'has_video': has_video,'has_audio':has_audio,'media_type':'video' if has_video else 'audio' if has_audio else 'images', 'heights': heights,'video_sizes':video_format_sizes(post,heights),'original_only':bool(post.get('original_only')),'source_author':post.get('source_author'),'context_tweet':post.get('context_tweet'),'audio_modes':['audio','mp3'] if has_audio else []}
+    return {'caption': caption, 'title': title, 'language': language, 'has_video': has_video,'has_audio':has_audio,'media_type':'video' if has_video else 'audio' if has_audio else 'images', 'heights': heights,'video_sizes':video_format_sizes(post,heights),'original_only':bool(post.get('original_only')),'source_author':post.get('source_author'),'context_tweet':post.get('context_tweet'),'audio_modes':['audio','mp3'] if has_audio else [],'shared_comment':post.get('shared_comment')}
 
 
 def convert_sticker(source, output):
@@ -1054,11 +1070,6 @@ def notify_completion(job):
 def execute(job):
     began=time.monotonic();timings={'queue_ms':round((time.time()-jobs.get(job.id,{}).get('created',time.time()))*1000)}
     try:
-        comment_count=0
-        host=(urlparse(job.url or '').hostname or '').removeprefix('www.')
-        if job.with_comments and job.kind in ('download','verify') and job.mode=='video' and host in ('tiktok.com','m.tiktok.com','vm.tiktok.com','vt.tiktok.com'):
-            caption,comment_count=tiktok_comment_caption(job.url,job.caption)
-            job=job.model_copy(update={'caption':caption,'caption_entities':[]})
         with tempfile.TemporaryDirectory(prefix='bb-media-') as directory:
             if job.kind == 'sticker':
                 f = telegram('getFile', {'file_id': job.file_id})
@@ -1087,7 +1098,6 @@ def execute(job):
                 elif job.kind=='verify':
                     files=download(post,job,directory)
                     result={'verification_only':True,'metadata':metadata(post),'files':[{'kind':kind,'bytes':p.stat().st_size,'sha256':hashlib.sha256(p.read_bytes()).hexdigest()} for kind,p in files]}
-                    if job.with_comments:result['comment_count']=comment_count
                     if (urlparse(job.url or '').hostname or '').removeprefix('www.')=='instagram.com':
                         with contextlib.ExitStack() as stack:
                             for index,(kind,path) in enumerate(files):
@@ -1121,7 +1131,7 @@ def execute(job):
 
 @app.get('/health')
 def health():
-    return {'ok': True, 'release': '2026-11-09-tiktok-comments'}
+    return {'ok': True, 'release': '2026-11-09-tiktok-shared-comment'}
 
 
 @app.post('/jobs')
