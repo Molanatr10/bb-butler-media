@@ -597,6 +597,30 @@ class MediaTests(unittest.TestCase):
         self.assertIn(body['cover'].removeprefix('attach://'),files)
         self.assertIn(body['thumbnail'].removeprefix('attach://'),files)
 
+    def test_tiktok_prefers_compatible_video_for_remote_and_local_delivery(self):
+        job=app.Request(**{**self.job,'kind':'download','mode':'video',
+                          'url':'https://www.tiktok.com/t/ZPLqxkx7d/','height':1024})
+        h264={'format_id':'h264','height':1024,'ext':'mp4','vcodec':'h264','acodec':'aac',
+              'protocol':'https','url':'https://cdn.example.org/ready.mp4','filesize':2600000,'tbr':350}
+        h265={**h264,'format_id':'h265','vcodec':'h265','tbr':425}
+        info={'id':'example','formats':[h264,h265]}
+        post={'engine':'yt-dlp','info':info,'entries':[info]}
+        with patch.object(app,'public_url',side_effect=lambda url:url):
+            self.assertEqual(app.direct_items(post,job),[('video',h264['url'])])
+        with tempfile.TemporaryDirectory() as directory:
+            def acquire(command,*args,**kwargs):
+                Path(directory,'video-001.mp4').write_bytes(b'video')
+            with patch.object(app,'run',side_effect=acquire) as command,patch.object(
+                app,'normalize_video',return_value=Path(directory,'ready.mp4')
+            ):
+                app.download(post,job,directory)
+            args=command.call_args.args[0]
+            self.assertEqual(args[args.index('-f')+1],'h264')
+            self.assertIn('--load-info-json',args)
+        for change in ({'mode':'mp3'},{'height':360},{'url':'https://www.instagram.com/reel/example/'}):
+            with self.subTest(change=change):
+                self.assertIsNone(app.tiktok_ready_video(post,job.model_copy(update=change)))
+
 
     def test_deezer_catalog_rejects_wrong_artist_and_version(self):
         entity={'title':'Cheshme Man','artists':[{'name':'Dariush'}],'duration':297080}
