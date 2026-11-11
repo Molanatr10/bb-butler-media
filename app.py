@@ -894,6 +894,23 @@ def download_audio(post,job,directory):
     return normalized
 
 
+def tiktok_ready_video(post, job):
+    host=(urlparse(job.url or '').hostname or '').removeprefix('www.')
+    if post.get('engine')!='yt-dlp' or job.mode!='video' or host not in (
+        'tiktok.com','m.tiktok.com','vm.tiktok.com','vt.tiktok.com'
+    ) or len(post.get('entries',[]))!=1:
+        return None
+    candidates=[
+        f for f in post['entries'][0].get('formats',[])
+        if f.get('ext')=='mp4' and str(f.get('vcodec') or '').startswith(('h264','avc1'))
+        and str(f.get('acodec') or '').startswith(('aac','mp4a'))
+        and 0<float(f.get('height') or 0)<=(job.height or 1080)
+        and f.get('url') and str(f.get('protocol') or '')=='https'
+        and float(f.get('filesize') or 0)<=MAX_VIDEO
+    ]
+    return max(candidates,key=lambda f:(float(f['height']),float(f.get('tbr') or 0)),default=None)
+
+
 def download(post, job, directory):
     if job.mode in ('audio','mp3','preview'):return download_audio(post,job,directory)
     paths = []
@@ -921,6 +938,8 @@ def download(post, job, directory):
     elif post['engine'] == 'yt-dlp':
         height = job.height or 720
         fmt = f'bv*[height<={height}][ext=mp4]+ba[ext=m4a]/b[height<={height}][ext=mp4]/bv*[height<={height}]+ba/b[height<={height}]'
+        ready=tiktok_ready_video(post,job)
+        if ready:fmt=ready['format_id']
         if (urlparse(job.url or '').hostname or '').removeprefix('www.')=='instagram.com':
             # Instagram reports portrait DASH dimensions by their long edge and
             # may omit dimensions entirely on its ready-to-send MP4 variants.
@@ -1046,6 +1065,8 @@ def deliver(items, job, cached=False, remote=False):
 
 
 def direct_items(post,job):
+    ready=tiktok_ready_video(post,job)
+    if ready:return [('video',public_url(ready['url']))]
     if post.get('engine')!='direct' or job.mode not in ('video','images'):return None
     files=post.get('files') or []
     video_extensions=('mp4','mov','webm')
@@ -1141,7 +1162,7 @@ def execute(job):
 
 @app.get('/health')
 def health():
-    return {'ok': True, 'release': '2026-11-10-instagram-access'}
+    return {'ok': True, 'release': '2026-11-11-tiktok-h264'}
 
 
 @app.post('/jobs')
