@@ -1,0 +1,46 @@
+name: Media health and recovery
+
+on:
+  schedule:
+    - cron: '2-57/5 * * * *'
+  workflow_dispatch:
+    inputs:
+      force_redeploy:
+        description: Request one recovery deployment to verify the recovery path
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: media-health-recovery
+  cancel-in-progress: false
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - name: Check the public route
+        id: health
+        continue-on-error: true
+        run: python3 .github/scripts/check_media.py
+      - name: Request recovery deployment
+        if: steps.health.outcome == 'failure' || inputs.force_redeploy == true
+        env:
+          FORCE_REDEPLOY: ${{ inputs.force_redeploy }}
+        run: |
+          now=$(date +%s)
+          last=$(git log -1 --format=%ct)
+          if [ "$FORCE_REDEPLOY" != "true" ] && [ "$((now-last))" -lt 1800 ]; then
+            echo "A deployment was requested recently. Waiting for it to recover."
+            exit 0
+          fi
+          git config user.name "Nokar recovery"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit --allow-empty -m "Recover media service after health check"
+          git push origin HEAD:main
