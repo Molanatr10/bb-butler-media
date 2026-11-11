@@ -900,12 +900,16 @@ def tiktok_ready_video(post, job):
         'tiktok.com','m.tiktok.com','vm.tiktok.com','vt.tiktok.com'
     ) or len(post.get('entries',[]))!=1:
         return None
+    formats=post['entries'][0].get('formats',[])
+    target=max((float(f.get('height') or 0) for f in formats
+                if f.get('vcodec') not in (None,'none')
+                and 0<float(f.get('height') or 0)<=(job.height or 1080)),default=0)
     candidates=[
-        f for f in post['entries'][0].get('formats',[])
+        f for f in formats
         if f.get('ext')=='mp4' and str(f.get('vcodec') or '').startswith(('h264','avc1'))
         and str(f.get('acodec') or '').startswith(('aac','mp4a'))
-        and 0<float(f.get('height') or 0)<=(job.height or 1080)
-        and f.get('url') and str(f.get('protocol') or '')=='https'
+        and 0<float(f.get('height') or 0)==target
+        and f.get('url') and f.get('format_id') and str(f.get('protocol') or '')=='https'
         and float(f.get('filesize') or 0)<=MAX_VIDEO
     ]
     return max(candidates,key=lambda f:(float(f['height']),float(f.get('tbr') or 0)),default=None)

@@ -620,6 +620,8 @@ class MediaTests(unittest.TestCase):
         for change in ({'mode':'mp3'},{'height':360},{'url':'https://www.instagram.com/reel/example/'}):
             with self.subTest(change=change):
                 self.assertIsNone(app.tiktok_ready_video(post,job.model_copy(update=change)))
+        info['formats'].append({**h265,'height':1280,'format_id':'higher'})
+        self.assertIsNone(app.tiktok_ready_video(post,job.model_copy(update={'height':1280})))
 
 
     def test_deezer_catalog_rejects_wrong_artist_and_version(self):
