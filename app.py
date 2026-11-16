@@ -48,6 +48,9 @@ post_cache = {}
 cache_lock = threading.RLock()
 source_locks = {}
 file_cache = {}
+instagram_fallback_lock = threading.Lock()
+instagram_fallback_failures = {}
+instagram_fallback_reserved = 0
 FALLBACK_BASE = os.environ.get('YOUTUBE_FALLBACK_URL', 'https://yt.chocolatemoo53.com').rstrip('/')
 
 
@@ -416,10 +419,63 @@ def instagram_embed_post(url):
     files=[]
     for node in nodes:
         if float(node.get('video_duration') or 0)>600:raise MediaError('This free downloader supports videos up to 10 minutes.')
-        video=node.get('video_url');address=video or node.get('display_url')
+        video=node.get('video_url')
+        if not video and (node.get('is_video') or node.get('__typename')=='GraphVideo'):
+            raise MediaError('Instagram did not expose a playable video.')
+        address=video or node.get('display_url')
         if address:files.append((public_url(address),{'extension':'mp4' if video else 'jpg'}))
     if not files or len(files)>20:raise MediaError('No supported Instagram media was found.')
     return {'engine':'direct','files':files,'info':{'title':caption[:180] or 'Instagram media','description':caption},'original_only':True}
+
+
+def instagram_free_fallback(url):
+    """Optional, bounded Free-credit recovery; never adds funds or changes plans."""
+    global instagram_fallback_reserved
+    key=os.environ.get('FASTSAVER_API_KEY','').strip()
+    if not key:raise MediaError('The optional Instagram fallback is not connected.')
+    validate_source(url)
+    if urlparse(url).hostname not in ('instagram.com','www.instagram.com'):
+        raise MediaError('Unsupported Instagram fallback link.')
+    shortcode=urlparse(url).path.strip('/').split('/')[-1]
+    canonical=f'https://www.instagram.com/p/{shortcode}/'
+    with instagram_fallback_lock:
+        now=time.monotonic()
+        if instagram_fallback_failures.get(shortcode,0)>now:
+            raise MediaError('The Instagram fallback could not retrieve this post recently.')
+        try:
+            headers={'X-Api-Key':key,'Accept':'application/json'}
+            balance=source_http.get('https://api.fastsaver.io/v1/balance',headers=headers,timeout=10)
+            balance.raise_for_status();balance=balance.json()
+            credits=float(balance.get('credits',0));paid=float(balance.get('balance',-1))
+            # Free accounts can report auto_renew=true: only the plan and zero
+            # paid balance determine eligibility. No payment endpoint is used.
+            if balance.get('ok') is not True or str(balance.get('plan','')).lower()!='free' or paid!=0 or not math.isfinite(credits) or credits<1.5 or instagram_fallback_reserved+1.5>1000:
+                raise MediaError('The optional free Instagram allowance is unavailable.')
+            instagram_fallback_reserved+=1.5
+            response=source_http.get('https://api.fastsaver.io/v1/fetch',params={'url':canonical},headers=headers,timeout=20)
+            response.raise_for_status()
+            if len(response.content)>1024*1024:raise MediaError('The fallback returned too much metadata.')
+            data=response.json()
+            if data.get('ok') is not True or data.get('id')!=shortcode or data.get('source')!='instagram.com':
+                raise MediaError('The fallback did not return the requested Instagram post.')
+            nodes=data.get('items') if data.get('type')=='album' else [data]
+            if not isinstance(nodes,list) or not 0<len(nodes)<=20:raise MediaError('Unsupported Instagram album.')
+            files=[]
+            for node in nodes:
+                kind=node.get('type')
+                duration=float(node.get('duration') or 0)
+                if kind not in ('video','photo','image') or not math.isfinite(duration) or not 0<=duration<=600:
+                    raise MediaError('Unsupported Instagram fallback media.')
+                address=node.get('download_url')
+                if not isinstance(address,str) or key in address:raise MediaError('Unsupported fallback media address.')
+                files.append((public_url(address),{'extension':'mp4' if kind=='video' else 'jpg'}))
+            caption=data.get('caption') or ''
+            if not isinstance(caption,str):caption=''
+            return {'engine':'direct','files':files,'info':{'title':caption[:180] or 'Instagram media','description':caption[:16000]},'original_only':True}
+        except (httpx.HTTPError,MediaError,ValueError,TypeError,AttributeError,KeyError,OSError):
+            if len(instagram_fallback_failures)>=128:instagram_fallback_failures.clear()
+            instagram_fallback_failures[shortcode]=now+300
+            raise MediaError('The optional free Instagram fallback could not retrieve this post.') from None
 
 
 def tiktok_public_post(url):
@@ -494,6 +550,8 @@ def _extract_post_info(url,directory):
     if host.removeprefix('www.')=='instagram.com':
         try:return instagram_embed_post(url)
         except (MediaError,httpx.HTTPError,ValueError,KeyError):pass
+        try:return instagram_free_fallback(url)
+        except MediaError:pass
     public_limit = None
     if youtube_id(url):
         try:return omega_post(url,source_http)
@@ -1166,7 +1224,7 @@ def execute(job):
 
 @app.get('/health')
 def health():
-    return {'ok': True, 'release': '2026-11-11-tiktok-h264'}
+    return {'ok': True, 'release': '2026-11-16-instagram-free-fallback'}
 
 
 @app.post('/jobs')

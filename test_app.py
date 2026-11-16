@@ -16,6 +16,41 @@ from PIL import Image
 
 
 class MediaTests(unittest.TestCase):
+    def test_instagram_fallback_only_uses_free_credits_and_matching_media(self):
+        balance={'ok':True,'plan':'Free','credits':998,'balance':'0.00','auto_renew':True}
+        media={'ok':True,'id':'DfynyiTzTtD','source':'instagram.com','type':'video','download_url':'https://cdn.example.org/reel.mp4','caption':'Original caption'}
+        def response(data):return httpx.Response(200,json=data,request=httpx.Request('GET','https://api.fastsaver.io/v1/fetch'))
+        with patch.dict(os.environ,{'FASTSAVER_API_KEY':'test-private-key'}),patch.object(app,'instagram_fallback_failures',{}),patch.object(app,'instagram_fallback_reserved',0),patch.object(app.source_http,'get',side_effect=[response(balance),response(media)]) as get,patch.object(app,'public_url',side_effect=lambda x:x):
+            post=app.instagram_free_fallback('https://www.instagram.com/reel/DfynyiTzTtD/?tracking=ignored')
+            self.assertEqual(post['files'][0][1]['extension'],'mp4')
+            self.assertEqual(post['info']['description'],'Original caption')
+            self.assertEqual(get.call_args.kwargs['params']['url'],'https://www.instagram.com/p/DfynyiTzTtD/')
+        for changed in ({'plan':'Pro'},{'balance':'1.00'},{'credits':1}):
+            with patch.dict(os.environ,{'FASTSAVER_API_KEY':'test-private-key'}),patch.object(app,'instagram_fallback_failures',{}),patch.object(app.source_http,'get',return_value=response({**balance,**changed})) as get:
+                with self.assertRaises(app.MediaError):app.instagram_free_fallback('https://www.instagram.com/reel/DfynyiTzTtD/')
+                self.assertEqual(get.call_count,1)
+
+    def test_instagram_fallback_rejects_wrong_post_and_suppresses_repeat_cost(self):
+        payloads=[{'ok':True,'plan':'Free','credits':998,'balance':'0'}, {'ok':True,'id':'wrong','source':'instagram.com','type':'video','download_url':'https://cdn.example.org/wrong.mp4'}]
+        responses=[httpx.Response(200,json=p,request=httpx.Request('GET','https://api.fastsaver.io/v1/fetch')) for p in payloads]
+        with patch.dict(os.environ,{'FASTSAVER_API_KEY':'test-private-key'}),patch.object(app,'instagram_fallback_failures',{}),patch.object(app,'instagram_fallback_reserved',0),patch.object(app.source_http,'get',side_effect=responses) as get:
+            for _ in range(2):
+                with self.assertRaises(app.MediaError):app.instagram_free_fallback('https://www.instagram.com/reel/DfynyiTzTtD/')
+            self.assertEqual(get.call_count,2)
+
+    def test_instagram_fallback_precedes_blocked_extractors(self):
+        recovered={'engine':'direct','files':[('https://cdn.example.org/reel.mp4',{'extension':'mp4'})]}
+        with patch.object(app,'instagram_embed_post',side_effect=app.MediaError('No embed')),patch.object(app,'instagram_free_fallback',return_value=recovered),patch.object(app,'run') as run:
+            self.assertIs(app._extract_post_info('https://www.instagram.com/reel/DfynyiTzTtD/','unused'),recovered)
+            run.assert_not_called()
+
+    def test_instagram_video_cover_is_never_sent_as_photo(self):
+        context={'gql_data':{'shortcode_media':{'shortcode':'AbCd123','__typename':'GraphVideo','display_url':'https://cdn.example.org/cover.jpg'}}}
+        body='"contextJSON":'+json.dumps(json.dumps(context))
+        response=httpx.Response(200,text=body,request=httpx.Request('GET','https://www.instagram.com/'))
+        with patch.object(app.source_http,'get',return_value=response):
+            with self.assertRaisesRegex(app.MediaError,'playable'):app.instagram_embed_post('https://www.instagram.com/reel/AbCd123/')
+
     def test_spotify_blocked_source_uses_same_verified_recording_and_reuses_selection(self):
         source={'engine':'direct','source_url':'https://www.youtube.com/watch?v=Gg7WaROxggI','expected_duration':320.066,'info':{'duration':320}}
         original={'engine':'spotify','entity':{}};job=app.Request(**{**self.job,'kind':'verify','mode':'mp3'})
