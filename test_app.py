@@ -16,6 +16,18 @@ from PIL import Image
 
 
 class MediaTests(unittest.TestCase):
+    def test_youtube_free_fallback_offers_only_verified_sizes_for_the_requested_video(self):
+        url = 'https://www.youtube.com/watch?v=RelQ2qGZrng'
+        data = {'ok': True, 'video_id': 'RelQ2qGZrng', 'title': 'Example', 'duration': 526,
+                'formats': [{'type': 'video', 'format': '360p', 'filesize': 20065904},
+                            {'type': 'video', 'format': '1080p', 'filesize': 106900145}]}
+        with patch.object(app, 'fastsaver_free_request', return_value=data):
+            post = app.youtube_free_post(url)
+            self.assertEqual(app.metadata(post)['heights'], [360])
+        with patch.object(app, 'fastsaver_free_request', return_value={**data, 'video_id': 'different00'}):
+            with self.assertRaises(app.MediaError):
+                app.youtube_free_post(url)
+
     def test_instagram_fallback_only_uses_free_credits_and_matching_media(self):
         balance={'ok':True,'plan':'Free','credits':998,'balance':'0.00','auto_renew':True}
         media={'ok':True,'id':'DfynyiTzTtD','source':'instagram.com','type':'video','download_url':'https://cdn.example.org/reel.mp4','caption':'Original caption'}

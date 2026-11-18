@@ -430,9 +430,78 @@ def instagram_embed_post(url):
     return {'engine':'direct','files':files,'info':{'title':caption[:180] or 'Instagram media','description':caption},'original_only':True}
 
 
+def fastsaver_free_request(method, endpoint, cost, **kwargs):
+    """Call under the shared fallback lock to serialize use of free credits."""
+    global instagram_fallback_reserved
+    key = os.environ.get('FASTSAVER_API_KEY', '').strip()
+    if not key:
+        raise MediaError('The optional media fallback is not connected.')
+    headers = {'X-Api-Key': key, 'Accept': 'application/json'}
+    balance = source_http.get('https://api.fastsaver.io/v1/balance', headers=headers, timeout=10)
+    balance.raise_for_status()
+    balance = balance.json()
+    credits = float(balance.get('credits', 0))
+    paid = float(balance.get('balance', -1))
+    if (balance.get('ok') is not True or str(balance.get('plan', '')).lower() != 'free'
+            or paid != 0 or not math.isfinite(credits) or credits < cost
+            or instagram_fallback_reserved + cost > 1000):
+        raise MediaError('The optional free media allowance is unavailable.')
+    instagram_fallback_reserved += cost
+    request = source_http.get if method == 'GET' else source_http.post
+    response = request('https://api.fastsaver.io/v1' + endpoint, headers=headers, **kwargs)
+    response.raise_for_status()
+    if len(response.content) > 1024 * 1024:
+        raise MediaError('The fallback returned too much metadata.')
+    return response.json()
+
+
+def youtube_free_post(url):
+    video_id = youtube_id(url)
+    with instagram_fallback_lock:
+        data = fastsaver_free_request('GET', '/youtube/info', 2, params={'url': url}, timeout=30)
+    if data.get('ok') is not True or data.get('video_id') != video_id or any(
+        data.get(flag) for flag in ('is_live', 'is_live_content', 'is_post')
+    ):
+        raise MediaError('The free fallback could not identify this YouTube video.')
+    duration = float(data.get('duration') or 0)
+    if not math.isfinite(duration) or not 0 < duration <= 1800:
+        raise MediaError('This free YouTube downloader supports videos up to 30 minutes.')
+    allowed = {str(height) + 'p': height for height in (144, 240, 360, 480, 720, 1080)}
+    sizes = {}
+    for entry in data.get('formats') or []:
+        height = allowed.get(entry.get('format'))
+        size = entry.get('filesize')
+        if entry.get('type') == 'video' and height and type(size) is int and 0 < size <= MAX_VIDEO:
+            sizes[str(height)] = {'bytes': size, 'estimated': True}
+    if not sizes:
+        raise MediaError('No YouTube video options fit the 45 MiB download limit.')
+    title = str(data.get('title') or 'YouTube video')[:180]
+    return {'engine': 'fastsaver-youtube', 'video_id': video_id, 'source_url': url,
+            'info': {'title': title, 'duration': duration}, 'max_video_duration': 1800,
+            'heights': sorted(map(int, sizes)), 'video_sizes': sizes, 'has_audio': False}
+
+
+def download_free_youtube(post, height, directory):
+    choices = [size for size in post['heights'] if size <= (height or 720)]
+    if not choices:
+        raise MediaError('That video resolution is unavailable.')
+    with instagram_fallback_lock:
+        data = fastsaver_free_request('POST', '/youtube/download', 15,
+            json={'url': post['source_url'], 'format': str(max(choices)) + 'p'}, timeout=35)
+    address = data.get('download_url') or ''
+    parsed = urlparse(address)
+    if (data.get('ok') is not True or data.get('video_id') != post['video_id']
+            or not (parsed.hostname or '').endswith('.fastsaver.io')
+            or parsed.path not in ('/dl', '/v1/tunnel')):
+        raise MediaError('The fallback did not return the requested YouTube video.')
+    target = Path(directory) / 'youtube-fallback.mp4'
+    fetch_file(address, target, MAX_VIDEO, timeout=45)
+    validate_native_duration([target], post, {}, directory)
+    return target
+
+
 def instagram_free_fallback(url):
     """Optional, bounded Free-credit recovery; never adds funds or changes plans."""
-    global instagram_fallback_reserved
     key=os.environ.get('FASTSAVER_API_KEY','').strip()
     if not key:raise MediaError('The optional Instagram fallback is not connected.')
     validate_source(url)
@@ -445,19 +514,7 @@ def instagram_free_fallback(url):
         if instagram_fallback_failures.get(shortcode,0)>now:
             raise MediaError('The Instagram fallback could not retrieve this post recently.')
         try:
-            headers={'X-Api-Key':key,'Accept':'application/json'}
-            balance=source_http.get('https://api.fastsaver.io/v1/balance',headers=headers,timeout=10)
-            balance.raise_for_status();balance=balance.json()
-            credits=float(balance.get('credits',0));paid=float(balance.get('balance',-1))
-            # Free accounts can report auto_renew=true: only the plan and zero
-            # paid balance determine eligibility. No payment endpoint is used.
-            if balance.get('ok') is not True or str(balance.get('plan','')).lower()!='free' or paid!=0 or not math.isfinite(credits) or credits<1.5 or instagram_fallback_reserved+1.5>1000:
-                raise MediaError('The optional free Instagram allowance is unavailable.')
-            instagram_fallback_reserved+=1.5
-            response=source_http.get('https://api.fastsaver.io/v1/fetch',params={'url':canonical},headers=headers,timeout=20)
-            response.raise_for_status()
-            if len(response.content)>1024*1024:raise MediaError('The fallback returned too much metadata.')
-            data=response.json()
+            data=fastsaver_free_request('GET','/fetch',1.5,params={'url':canonical},timeout=20)
             if data.get('ok') is not True or data.get('id')!=shortcode or data.get('source')!='instagram.com':
                 raise MediaError('The fallback did not return the requested Instagram post.')
             nodes=data.get('items') if data.get('type')=='album' else [data]
@@ -584,6 +641,10 @@ def _extract_post_info(url,directory):
         if 'youtu' in (urlparse(url).hostname or ''):
             if public_limit:
                 raise MediaError(public_limit) from None
+            try:
+                return youtube_free_post(url)
+            except (MediaError,httpx.HTTPError,ValueError,TypeError,AttributeError):
+                pass
             raise
     raw = run([sys.executable, '-m', 'gallery_dl', '--config-ignore', '--dump-json', '--range', '1-21', '--', url], directory, timeout=35, json_output=True)
     files = [(r[1], r[2]) for r in raw if isinstance(r, list) and len(r) > 2 and r[0] == 3]
@@ -668,7 +729,7 @@ def metadata(post):
         has_audio = any(f.get('acodec') not in ('none',None) for f in all_formats)
         if not heights and has_video:
             heights = [min(1080, source_resolution(entries[0],portrait) or 720)]
-    elif post['engine']=='youtube-native':
+    elif post['engine'] in ('youtube-native','fastsaver-youtube'):
         heights=post['heights'];has_video=bool(heights);has_audio=post['has_audio']
     elif post['engine']=='invidious':
         heights=sorted({format_height(f) for f in post['formats'] if str(f.get('type','')).startswith('video/') and 144<=format_height(f)<=1080})
@@ -978,7 +1039,9 @@ def tiktok_ready_video(post, job):
 def download(post, job, directory):
     if job.mode in ('audio','mp3','preview'):return download_audio(post,job,directory)
     paths = []
-    if post['engine']=='youtube-native':
+    if post['engine']=='fastsaver-youtube':
+        paths=[download_free_youtube(post,job.height,directory)]
+    elif post['engine']=='youtube-native':
         data=youtube_native(post.get('source_url') or job.url,directory,'video',job.height)
         paths=[Path(directory)/name for name in data['files']]
         if len(paths)==2:
@@ -1226,7 +1289,7 @@ def execute(job):
 
 @app.get('/health')
 def health():
-    return {'ok': True, 'release': '2026-11-17-football-scorecards-v2'}
+    return {'ok': True, 'release': '2026-11-18-youtube-free-fallback'}
 
 
 class FootballGoal(BaseModel):
