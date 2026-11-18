@@ -21,6 +21,8 @@ from difflib import SequenceMatcher
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException
+from fastapi.responses import Response
+from football_card import render_card
 from langdetect import detect, DetectorFactory
 from PIL import Image, ImageOps
 from pydantic import BaseModel, ConfigDict, Field
@@ -118,10 +120,10 @@ def public_url(url):
     return url
 
 
-def fetch_file(url, target, limit, headers=None):
+def fetch_file(url, target, limit, headers=None,timeout=30):
     for _ in range(5):
         public_url(url)
-        with source_http.stream('GET', url, headers=headers or {},timeout=30) as r:
+        with source_http.stream('GET', url, headers=headers or {},timeout=timeout) as r:
             if r.is_redirect:
                 from urllib.parse import urljoin
                 url = urljoin(url, r.headers.get('location', ''))
@@ -1224,7 +1226,51 @@ def execute(job):
 
 @app.get('/health')
 def health():
-    return {'ok': True, 'release': '2026-11-16-instagram-free-fallback'}
+    return {'ok': True, 'release': '2026-11-17-football-scorecards'}
+
+
+class FootballGoal(BaseModel):
+    player: str = Field(max_length=100)
+    minute: str = Field(max_length=20)
+    assist: str = Field(default='',max_length=100)
+    own_goal: bool = False
+    penalty: bool = False
+
+
+class FootballTeam(BaseModel):
+    name: str = Field(min_length=1,max_length=100)
+    score: int = Field(ge=0,le=50)
+    badge: str = Field(default='',max_length=500)
+    round_badge: bool = False
+    goals: list[FootballGoal] = Field(default_factory=list,max_length=20)
+    cards: list[str] = Field(default_factory=list,max_length=20)
+
+
+class FootballCard(BaseModel):
+    status: str = Field(pattern=r'^(Half-time|Finished)$')
+    competition: str = Field(default='',max_length=100)
+    penalties: str = Field(default='',max_length=30)
+    teams: list[FootballTeam] = Field(min_length=2,max_length=2)
+
+
+@app.post('/football-card')
+def football_card(data: FootballCard,authorization: str = Header(default='')):
+    secret=os.environ.get('MEDIA_BACKEND_SECRET','')
+    if len(secret)<32 or not hmac.compare_digest(authorization,f'Bearer {secret}'):
+        raise HTTPException(401,'Unauthorized')
+    badges=[]
+    for team in data.teams:
+        badge=None
+        try:
+            address=urlparse(team.badge)
+            if address.scheme=='https' and address.hostname=='a.espncdn.com' and address.path.startswith('/i/teamlogos/'):
+                with tempfile.TemporaryDirectory() as directory:
+                    target=Path(directory)/'badge.png'
+                    fetch_file(team.badge,target,2*1024*1024,timeout=3)
+                    with Image.open(target) as image:badge=image.convert('RGBA')
+        except (MediaError,httpx.HTTPError,OSError,ValueError):pass
+        badges.append(badge)
+    return Response(render_card(data.model_dump(),badges),media_type='image/png')
 
 
 @app.post('/jobs')
