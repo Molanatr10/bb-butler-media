@@ -10,6 +10,14 @@ from football_card import render_card
 
 
 class FootballCardTests(unittest.TestCase):
+    def test_round_flags_do_not_turn_transparent_padding_into_black_bands(self):
+        badge=Image.new('RGBA',(300,300))
+        from PIL import ImageDraw
+        ImageDraw.Draw(badge).rectangle((0,70,299,229),fill=(240,30,30,255))
+        data={'status':'Finished','teams':[{'name':'Home','score':0,'round_badge':True},{'name':'Away','score':0}]}
+        result=Image.open(io.BytesIO(render_card(data,(badge,None))))
+        self.assertEqual(result.getpixel((180,60)),(240,30,30))
+
     def test_endpoint_requires_auth_and_returns_real_png_without_external_badges(self):
         payload={'status':'Half-time','competition':'Test','teams':[
             {'name':'Wales','score':0,'badge':'https://127.0.0.1/private'},

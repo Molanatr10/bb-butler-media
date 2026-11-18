@@ -48,6 +48,8 @@ def render_card(data, badges=(None, None)):
         if badge:
             badge = badge.convert('RGBA')
             if team.get('round_badge'):
+                bounds=badge.getchannel('A').getbbox()
+                if bounds:badge=badge.crop(bounds)
                 badge = ImageOps.fit(badge,(180,180),method=Image.Resampling.LANCZOS)
                 mask=Image.new('L',(180,180)); ImageDraw.Draw(mask).ellipse((0,0,179,179),fill=255)
                 badge.putalpha(mask)
