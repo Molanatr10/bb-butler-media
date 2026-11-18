@@ -86,7 +86,7 @@ def render_card(data, badges=(None, None)):
                 text = 'Assist: ' + goal['assist']
                 draw.text((start + 42, y + 42), text, font=fitted(draw, text, 22, end - start - 42), fill=muted)
         if not goals:
-            draw.text((start, 390), 'No goals', font=font(28), fill=muted)
+            draw.text((start, 390), 'Scorers pending' if team['score'] else 'No goals', font=font(28), fill=muted)
         cards = team.get('cards', [])
         if cards:
             text = '  ·  '.join(cards)
